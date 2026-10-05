@@ -245,18 +245,29 @@ pub(crate) fn encode_log_group<W: Write>(
 }
 
 pub(crate) fn calc_log_group_encoded_len(metadata: &LogGroupMetadata, logs: &[Log]) -> usize {
-    encoded_len_repeated(1u32, logs.iter(), logs.len())
-        + metadata
-            .topic
-            .is_empty()
-            .then(|| encoded_str_len(3u32, &metadata.topic))
-            .unwrap_or(0)
-        + metadata
-            .source
-            .is_empty()
+    calc_log_group_metadata_encoded_len(metadata)
+        + logs
+            .iter()
+            .map(calc_log_group_log_encoded_len)
+            .sum::<usize>()
+}
+
+/// Calculate the encoded size contributed by metadata in a log group.
+pub(crate) fn calc_log_group_metadata_encoded_len(metadata: &LogGroupMetadata) -> usize {
+    (!metadata.topic.is_empty())
+        .then(|| encoded_str_len(3u32, &metadata.topic))
+        .unwrap_or(0)
+        + (!metadata.source.is_empty())
             .then(|| encoded_str_len(4u32, &metadata.source))
             .unwrap_or(0)
         + encoded_len_repeated(6u32, metadata.log_tags.iter(), metadata.log_tags.len())
+}
+
+/// Calculate the incremental encoded size of one log in a log group.
+#[inline]
+pub(crate) fn calc_log_group_log_encoded_len(log: &Log) -> usize {
+    let len = log.encoded_len();
+    key_len(1u32) + encoded_len_varint(len as u64) + len
 }
 
 trait Message {
@@ -292,12 +303,12 @@ impl<K: AsRef<str>, V: AsRef<str>> Message for (K, V) {
 impl Message for Log {
     #[inline]
     fn encode_into_vec<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        encode_varint_field(1u32, self.timestamp as u64, writer).expect("infallible");
+        encode_varint_field(1u32, self.timestamp as u64, writer)?;
         for msg in &self.contents {
-            encode_message(2u32, &msg, writer).expect("infallible");
+            encode_message(2u32, &msg, writer)?;
         }
         if let Some(value) = self.subsec_nanosecond {
-            encode_fixed32(4u32, value, writer).expect("infallible");
+            encode_fixed32(4u32, value, writer)?;
         }
         Ok(())
     }
@@ -428,5 +439,42 @@ mod tests {
             "size_of::<LogGroupMetadata>() = {}",
             size_of::<LogGroupMetadata>()
         );
+    }
+
+    #[test]
+    fn encoded_len_matches_actual_output_with_topic_and_source() {
+        let metadata = LogGroupMetadata::new()
+            .with_topic("topic")
+            .with_source("source")
+            .with_tag(MayStaticKey::from_static("tag"), "value");
+        let logs = [
+            Log::new(1, None).with(MayStaticKey::from_static("a"), "b"),
+            Log::new(2, Some(3)).with(MayStaticKey::from_static("long"), "value"),
+        ];
+        let mut encoded = Vec::new();
+
+        encode_log_group(&mut encoded, &metadata, &logs).unwrap();
+
+        assert_eq!(calc_log_group_encoded_len(&metadata, &logs), encoded.len());
+        assert_eq!(
+            calc_log_group_metadata_encoded_len(&metadata)
+                + logs
+                    .iter()
+                    .map(calc_log_group_log_encoded_len)
+                    .sum::<usize>(),
+            encoded.len()
+        );
+    }
+
+    #[test]
+    fn empty_topic_and_source_do_not_add_encoded_bytes() {
+        let metadata = LogGroupMetadata::new();
+        let logs = [Log::new(1, None)];
+        let mut encoded = Vec::new();
+
+        encode_log_group(&mut encoded, &metadata, &logs).unwrap();
+
+        assert_eq!(calc_log_group_encoded_len(&metadata, &logs), encoded.len());
+        assert_eq!(calc_log_group_metadata_encoded_len(&metadata), 0);
     }
 }
