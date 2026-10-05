@@ -199,12 +199,15 @@ cargo run -p aliyun-sls --features reporter --example reporter_stress --release 
 cargo run -p aliyun-sls --features reporter --example reporter_stress --release -- 1000000
 cargo run -p aliyun-sls --features persist --example persistent_stress --release -- 100000
 cargo run -p aliyun-sls --features persist --example persistent_stress --release -- 1000000
+cargo run -p aliyun-sls --features persist --example persistent_stress --release -- 100000 536870912 8
 ```
 
 The persistent harness uses a temporary SQLite spool, never starts an upload
 worker, reports admission latency/throughput, pending rows/bytes, retention
 and admission failures, `.db`/`.wal`/`.shm` size, and Linux RSS when available,
-then removes its temporary data. It does not fake successful network delivery.
+then removes its temporary data. Its optional arguments are event count,
+storage bytes, and producer thread count. It does not fake successful network
+delivery.
 
 ## License
 [![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Flightsing%2Ftracing-aliyun-sls.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2Flightsing%2Ftracing-aliyun-sls?ref=badge_large)

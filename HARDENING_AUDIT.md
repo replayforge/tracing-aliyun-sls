@@ -611,7 +611,7 @@ cargo deny check
 
 Feature-off tests passed with 22 `aliyun-sls` unit tests and 4
 `tracing-aliyun-sls` unit tests; one credential-gated live test was ignored.
-The workspace persist run passed 51 `aliyun-sls` unit tests, 2 persistence
+The workspace persist run passed 56 `aliyun-sls` unit tests, 2 persistence
 subprocess integration tests, and 4 `tracing-aliyun-sls` unit tests; the same
 live test was ignored. Workspace documentation tests passed 2 tests; the
 `aliyun-sls` crate currently has no doctests.
@@ -635,3 +635,56 @@ microseconds average and 13.43 milliseconds maximum admission latency,
 bytes. RSS was unavailable on this macOS host. These are local Apple Silicon
 measurements of synchronous durable admission without an upload worker, not a
 service-level performance guarantee.
+
+## Persistence performance addendum
+
+Profiling showed that WAL commit/checkpoint I/O dominated durable admission;
+serialization and relaxed statistics atomics were not material hot spots.
+The writer now drains only already-waiting consecutive inserts into a bounded
+group commit of at most 32 events or 1 MiB. It never sleeps to form a group,
+and every caller is acknowledged only after the transaction containing its
+event commits. Savepoints isolate retention/size rejection, while a fatal
+transaction failure rolls back and fails the entire group.
+
+Hot SQLite statements use a bounded connection-local statement cache. The WAL
+checkpoint target is derived from the configured storage budget and capped at
+16 MiB, reducing checkpoint frequency without allowing an unbounded policy.
+The trade-off is a larger temporary WAL footprint.
+
+Release-mode 100,000-event results after optimization:
+
+```text
+producers=1  throughput=35,824-36,700 events/s
+producers=2  throughput=42,175 events/s  average=47.4 us  max=1.64 ms
+producers=4  throughput=66,239 events/s  average=60.3 us  max=1.63 ms
+producers=8  throughput=95,304-96,291 events/s
+```
+
+The optimized 1,000,000-event, eight-producer run accepted every event with no
+failure or eviction at 97,364 events/second. Compared with the original
+single-producer 100,000-event result, repeated single-producer throughput
+improved about 3-5%; concurrent producers benefit substantially from shared commits. Combined
+SQLite physical size for 100,000 events increased from about 18.0 MiB to about
+30.6 MiB because checkpoints are less frequent.
+
+Compile/dependency cleanup removed redundant direct `async-channel`,
+`futures-util`, `thiserror`, and `nyquest-interface` declarations, plus unused
+private protobuf wire variants. docs.rs now uses one valid explicit
+backend/compression/persistence feature set instead of incompatible
+all-features. Invalid dual-backend and dual-compression configurations produce
+direct compile errors.
+
+### Sampling-guided compiler hints
+
+Release builds with debug symbols were sampled on macOS for eight seconds.
+The 3,000,000-event, eight-producer persistence profile recorded about 82% of
+samples in the SQLite writer. WAL writes and commit processing dominated; this
+does not justify forcing Rust admission functions inline.
+
+The 500,000,000-attempt memory-only profile concentrated application samples
+in `Reporter::try_report`, the bounded queue, and `Log::with`. Three-run
+100,000,000-attempt A/B tests showed that inlining `Log::with` raised median
+throughput from 19.24 million to 20.44 million attempts/second (about 6%).
+Inlining the much larger `Reporter::try_report` together with it reduced median
+throughput to 16.88 million attempts/second, so that hint was rejected.
+No `#[inline(always)]` annotations were added.

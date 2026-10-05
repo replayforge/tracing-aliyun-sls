@@ -12,8 +12,8 @@ Client for [Aliyun SLS](https://help.aliyun.com/zh/sls/) (Aliyun Log Service).
 
 - [`reqwest`]:
   `reqwest` feature gate Use [`reqwest`] as the HTTP backend, but do not enable any TLS features.
-  - `reqwest-default-tls`: use [`reqwest`] as the HTTP backend and default TLS provider.
-  - `reqwest-rustls`: use [`reqwest`] as the HTTP backend and [`rustls`] TLS provider.
+  - `reqwest-default-tls`: use [`reqwest`] with [`rustls`] (the default feature alias).
+  - `reqwest-rustls`: use [`reqwest`] with [`rustls`] (the explicit alias).
   - or, uou can configure the TLS provider by manually enabling feature gates in [`reqwest`].
 - [`nyquest`]: A platform native HTTP client, provides smaller binary size.
 
@@ -121,9 +121,11 @@ available, pending rows/bytes, evictions/failures, and combined
 ```text
 cargo run -p aliyun-sls --features persist --example persistent_stress --release -- 100000
 cargo run -p aliyun-sls --features persist --example persistent_stress --release -- 1000000
+cargo run -p aliyun-sls --features persist --example persistent_stress --release -- 100000 536870912 8
 ```
 
-It does not start reporting or fake a successful delivery.
+The optional arguments are event count, storage bytes, and producer thread
+count. It does not start reporting or fake a successful delivery.
 
 ## Unstable Features
 
