@@ -31,6 +31,7 @@ default = ["reqwest-default-tls"]
 # re-export aliyun-sls features
 deflate = ["aliyun-sls/deflate"]
 lz4 = ["aliyun-sls/lz4"]
+persist = ["aliyun-sls/persist"]
 
 reqwest = ["aliyun-sls/reqwest"]
 reqwest-default-tls = ["aliyun-sls/reqwest-default-tls"]

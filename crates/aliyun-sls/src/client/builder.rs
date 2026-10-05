@@ -165,9 +165,15 @@ impl<'a> SlsClientBuilder<'a> {
         };
 
         let url = format!("https://{project}.{endpoint}{canonicalized_resource}");
+        #[cfg(feature = "persist")]
+        let idempotent_url_prefix = format!("https://{project}.{endpoint}");
 
         let client = SlsClientInner {
             url,
+            #[cfg(feature = "persist")]
+            idempotent_url_prefix,
+            #[cfg(feature = "persist")]
+            logstore: logstore.to_owned(),
             signer: signer::Signer {
                 hmac,
                 access_key,
@@ -222,5 +228,38 @@ mod tests {
 
         assert_eq!(client.inner.connect_timeout, Duration::from_secs(1));
         assert_eq!(client.inner.request_timeout, Duration::from_secs(7));
+    }
+
+    #[cfg(feature = "persist")]
+    #[test]
+    fn persistence_destination_excludes_credentials_and_includes_logstore() {
+        let first = build_client(SlsClientBuilder::default());
+        let same_destination = SlsClientBuilder::default()
+            .access_key("different-key")
+            .access_secret("different-secret")
+            .expect("test secret")
+            .endpoint("example.com")
+            .project("project")
+            .logstore("logstore")
+            .build()
+            .expect("build same destination");
+        let other_logstore = SlsClientBuilder::default()
+            .access_key("key")
+            .access_secret("secret")
+            .expect("test secret")
+            .endpoint("example.com")
+            .project("project")
+            .logstore("other")
+            .build()
+            .expect("build other destination");
+
+        assert_eq!(
+            first.persistence_destination_fingerprint(),
+            same_destination.persistence_destination_fingerprint()
+        );
+        assert_ne!(
+            first.persistence_destination_fingerprint(),
+            other_logstore.persistence_destination_fingerprint()
+        );
     }
 }

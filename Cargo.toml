@@ -35,6 +35,7 @@ nyquest = { version = "0.4" }
 nyquest-interface = { version = "0.4" }
 nyquest-preset = { version = "0.4" }
 reqwest = { version = "0.12", default-features = false }
+rusqlite = { version = "0.40", default-features = false }
 sha1 = { version = "0.10", default-features = false }
 # This fork provides the `litemap` integration used by `proto::Map`. Pin the
 # exact reviewed revision so production builds do not follow a floating branch.

@@ -25,6 +25,14 @@
 //! - `lz4`: enable lz4 compression for logs.
 //! - `deflate`: enable deflate compression for logs.
 //!
+//! ### Reporting and persistence
+//!
+//! - `reporter`: enable the bounded batching [`reporter`] API.
+//! - `persist`: enable `reporter` plus the optional SQLite spool APIs. This
+//!   Cargo feature only makes persistence available; applications must also
+//!   opt in at runtime with
+//!   [`reporter::ReporterBuilder::build_with_persistence`].
+//!
 //! ### Inline Optimizations
 //!
 //! Inline features can control how many key-pairs are inlined before spill over to the heap.
@@ -68,6 +76,8 @@
 compile_error!("`lz4` and `deflate` cannot be enabled at the same time");
 
 mod client;
+#[cfg(feature = "persist")]
+mod persistence;
 mod proto;
 #[cfg(feature = "reporter")]
 #[cfg_attr(docsrs, doc(cfg(feature = "reporter")))]

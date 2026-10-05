@@ -24,6 +24,10 @@ pub struct SlsClient {
 
 struct SlsClientInner {
     url: String,
+    #[cfg(feature = "persist")]
+    idempotent_url_prefix: String,
+    #[cfg(feature = "persist")]
+    logstore: String,
     signer: signer::Signer,
     http_client: OnceCell<imp::HttpClient>,
     connect_timeout: std::time::Duration,
@@ -32,6 +36,12 @@ struct SlsClientInner {
     print_internal_error: bool,
     #[cfg(feature = "deflate")]
     compression_level: u8,
+}
+
+#[cfg(feature = "persist")]
+pub(crate) enum IdempotentPutResult {
+    Acknowledged,
+    Pending(SlsClientError),
 }
 
 /// Error type for SLS client operations.
@@ -84,6 +94,16 @@ impl SlsClient {
     /// Create a new SLS client builder.
     pub fn builder() -> SlsClientBuilder<'static> {
         SlsClientBuilder::default()
+    }
+
+    #[cfg(feature = "persist")]
+    pub(crate) fn persistence_destination_fingerprint(&self) -> Box<[u8]> {
+        format!(
+            "{}\0{}",
+            self.inner.idempotent_url_prefix, self.inner.logstore
+        )
+        .into_bytes()
+        .into_boxed_slice()
     }
 
     /// Put a log group to Aliyun SLS.
@@ -209,11 +229,147 @@ impl SlsClient {
 
         validate_response_status(status_code, Box::default())
     }
+
+    #[cfg(feature = "persist")]
+    pub(crate) async fn try_put_log_idempotent(
+        &self,
+        metadata: &LogGroupMetadata,
+        logs: &[Log],
+        spool_id: &[u8],
+        sequence_id: u64,
+    ) -> Result<(), SlsClientError> {
+        match self
+            .put_log_idempotent_inner(metadata, logs, spool_id, sequence_id)
+            .await
+        {
+            IdempotentPutResult::Acknowledged => Ok(()),
+            IdempotentPutResult::Pending(error) => Err(error),
+        }
+    }
+
+    #[cfg(feature = "persist")]
+    async fn put_log_idempotent_inner(
+        &self,
+        metadata: &LogGroupMetadata,
+        logs: &[Log],
+        spool_id: &[u8],
+        sequence_id: u64,
+    ) -> IdempotentPutResult {
+        let http_client = match self
+            .inner
+            .http_client
+            .get_or_try_init(|| {
+                imp::HttpClient::new(self.inner.connect_timeout, self.inner.request_timeout)
+            })
+            .await
+        {
+            Ok(client) => client,
+            Err(error) => return IdempotentPutResult::Pending(error.into()),
+        };
+        let (url, resource) = idempotent_route(
+            &self.inner.idempotent_url_prefix,
+            &self.inner.logstore,
+            spool_id,
+            sequence_id,
+        );
+        let raw_length = calc_log_group_encoded_len(metadata, logs);
+        let mut body = Vec::with_capacity(raw_length);
+        if let Err(error) = encode_log_group(&mut body, metadata, logs) {
+            return IdempotentPutResult::Pending(SlsClientError::Encode(error));
+        }
+        #[cfg(feature = "lz4")]
+        let body = lz4_flex::compress(&body);
+        #[cfg(feature = "deflate")]
+        let body = miniz_oxide::deflate::compress_to_vec_zlib(&body, self.inner.compression_level);
+        let signature = self
+            .inner
+            .signer
+            .sign_resource(raw_length, &body, &resource);
+        let builder = http_client
+            .post(&url)
+            .header(headers::AUTHORIZATION, signature.authorization)
+            .header(headers::CONTENT_LENGTH, body.len().to_string())
+            .header(headers::CONTENT_MD5, signature.content_md5)
+            .header(headers::DATE, signature.date)
+            .header(headers::LOG_BODY_RAW_SIZE, signature.raw_length);
+        #[cfg(feature = "lz4")]
+        let builder = builder.header(headers::LOG_COMPRESS_TYPE, "lz4");
+        #[cfg(feature = "deflate")]
+        let builder = builder.header(headers::LOG_COMPRESS_TYPE, "deflate");
+        let response = match builder.body(body).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(status) = imp::status_code_from_error(&error) {
+                    return IdempotentPutResult::Pending(SlsClientError::Http {
+                        status,
+                        message: "non-successful response".into(),
+                    });
+                }
+                return IdempotentPutResult::Pending(error.into());
+            }
+        };
+        let status = response.status();
+        let success = status.is_success();
+        let status_code = status.into();
+        if success {
+            return IdempotentPutResult::Acknowledged;
+        }
+        let body = response.text().await.unwrap_or_default();
+        let expected_key = hex::encode(spool_id);
+        if parses_prior_acknowledgement(&body, &expected_key, sequence_id) {
+            IdempotentPutResult::Acknowledged
+        } else {
+            IdempotentPutResult::Pending(SlsClientError::Http {
+                status: status_code,
+                message: "non-successful idempotent response".into(),
+            })
+        }
+    }
+}
+
+#[cfg(feature = "persist")]
+fn idempotent_route(
+    url_prefix: &str,
+    logstore: &str,
+    spool_id: &[u8],
+    sequence_id: u64,
+) -> (String, String) {
+    let resource = format!(
+        "/logstores/{logstore}/shards/route?key={}&seqid={sequence_id}",
+        hex::encode(spool_id)
+    );
+    (format!("{url_prefix}{resource}"), resource)
+}
+
+#[cfg(feature = "persist")]
+fn parses_prior_acknowledgement(body: &str, expected_key: &str, requested: u64) -> bool {
+    const PREFIX: &str = "error: sequence id is lower than expected, hash_key=";
+    let Some(rest) = body.strip_prefix(PREFIX) else {
+        return false;
+    };
+    let Some((hash_key, rest)) = rest.split_once(",current sequence_id=") else {
+        return false;
+    };
+    if hash_key != expected_key {
+        return false;
+    }
+    let Some((current, requested_text)) = rest.split_once(",requested sequence_id=") else {
+        return false;
+    };
+    let Ok(current) = current.parse::<u64>() else {
+        return false;
+    };
+    let Ok(response_requested) = requested_text.parse::<u64>() else {
+        return false;
+    };
+    response_requested == requested && current == requested
 }
 
 #[cfg(test)]
 mod tests {
     use super::{SlsClientBuilder, SlsClientError, validate_response_status};
+    #[cfg(feature = "persist")]
+    use super::{idempotent_route, parses_prior_acknowledgement};
 
     fn http_error(status: u16) -> SlsClientError {
         SlsClientError::Http {
@@ -252,6 +408,39 @@ mod tests {
                     Err(SlsClientError::Http { status: actual, .. }) if actual == status
                 ),
                 "status {status}"
+            );
+        }
+    }
+
+    #[cfg(feature = "persist")]
+    #[test]
+    fn idempotent_route_sorts_key_before_seqid() {
+        let (url, resource) =
+            idempotent_route("https://project.example.com", "logs", &[0x0a, 0xff], 42);
+        assert_eq!(resource, "/logstores/logs/shards/route?key=0aff&seqid=42");
+        assert_eq!(url, format!("https://project.example.com{resource}"));
+    }
+
+    #[cfg(feature = "persist")]
+    #[test]
+    fn prior_acknowledgement_parser_is_strict() {
+        assert!(parses_prior_acknowledgement(
+            "error: sequence id is lower than expected, hash_key=abc,current sequence_id=9,requested sequence_id=9",
+            "abc",
+            9
+        ));
+        for ambiguous in [
+            "current sequence_id=10,requested sequence_id=9",
+            "error: sequence id is lower than expected, hash_key=abc,current sequence_id=8,requested sequence_id=9",
+            "error: sequence id is lower than expected, hash_key=abc,current sequence_id=10,requested sequence_id=9",
+            "error: sequence id is lower than expected, hash_key=abc,current sequence_id=10,requested sequence_id=8",
+            "error: sequence id is lower than expected, hash_key=def,current sequence_id=9,requested sequence_id=9",
+            "error: sequence id is lower than expected, hash_key=,current sequence_id=10,requested sequence_id=9",
+            "error: sequence id is lower than expected, hash_key=abc,current sequence_id=10,requested sequence_id=9 trailing",
+        ] {
+            assert!(
+                !parses_prior_acknowledgement(ambiguous, "abc", 9),
+                "{ambiguous}"
             );
         }
     }

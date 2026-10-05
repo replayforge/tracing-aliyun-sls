@@ -14,6 +14,10 @@ version = "0.1.0"
 name = "reporter_stress"
 required-features = ["reporter"]
 
+[[example]]
+name = "persistent_stress"
+required-features = ["persist"]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
@@ -37,6 +41,7 @@ miniz_oxide = { workspace = true, features = ["with-alloc"], optional = true }
 nyquest = { workspace = true, optional = true }
 nyquest-interface = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
+rusqlite = { workspace = true, features = ["bundled"], optional = true }
 sha1.workspace = true
 smallvec = { workspace = true, features = ["litemap"] }
 thiserror.workspace = true
@@ -58,6 +63,7 @@ reporter = [
   "futures-util/async-await-macro",
   "futures-util/std",
 ]
+persist = ["reporter", "dep:rusqlite"]
 
 nightly = [
   "smallvec/may_dangle",

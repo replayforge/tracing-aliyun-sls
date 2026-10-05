@@ -270,6 +270,159 @@ pub(crate) fn calc_log_group_log_encoded_len(log: &Log) -> usize {
     key_len(1u32) + encoded_len_varint(len as u64) + len
 }
 
+#[cfg(feature = "persist")]
+pub(crate) fn encode_persisted_event(
+    metadata: &LogGroupMetadata,
+    log: &Log,
+) -> io::Result<Vec<u8>> {
+    let mut bytes =
+        Vec::with_capacity(calc_log_group_metadata_encoded_len(metadata) + log.encoded_len() + 32);
+    bytes.extend_from_slice(b"SLS1");
+    write_persisted_str(&mut bytes, &metadata.topic)?;
+    write_persisted_str(&mut bytes, &metadata.source)?;
+    write_persisted_pairs(&mut bytes, metadata.log_tags.iter())?;
+    bytes.extend_from_slice(&log.timestamp.to_le_bytes());
+    match log.subsec_nanosecond {
+        Some(value) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        None => bytes.push(0),
+    }
+    write_persisted_pairs(&mut bytes, log.contents.iter())?;
+    Ok(bytes)
+}
+
+#[cfg(feature = "persist")]
+pub(crate) fn decode_persisted_event(bytes: &[u8]) -> io::Result<(LogGroupMetadata, Log)> {
+    let mut input = PersistedInput::new(bytes);
+    if input.take(4)? != b"SLS1" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported persisted event version",
+        ));
+    }
+    let topic = input.string()?;
+    let source = input.string()?;
+    let mut metadata = LogGroupMetadata::new()
+        .with_topic(topic)
+        .with_source(source);
+    for (key, value) in input.pairs()? {
+        metadata.add_tag(MayStaticKey::new(key), value);
+    }
+    let timestamp = input.u32()?;
+    let subsec_nanosecond = match input.byte()? {
+        0 => None,
+        1 => Some(input.u32()?),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid persisted nanosecond marker",
+            ));
+        }
+    };
+    let mut log = Log::new(timestamp, subsec_nanosecond);
+    for (key, value) in input.pairs()? {
+        log.insert(MayStaticKey::new(key), value);
+    }
+    if !input.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing persisted event bytes",
+        ));
+    }
+    Ok((metadata, log))
+}
+
+#[cfg(feature = "persist")]
+fn write_persisted_pairs<K, V>(
+    output: &mut Vec<u8>,
+    pairs: impl Iterator<Item = (K, V)>,
+) -> io::Result<()>
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    let pairs = pairs.collect::<Vec<_>>();
+    let count = u32::try_from(pairs.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many persisted pairs"))?;
+    output.extend_from_slice(&count.to_le_bytes());
+    for (key, value) in pairs {
+        write_persisted_str(output, key.as_ref())?;
+        write_persisted_str(output, value.as_ref())?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "persist")]
+fn write_persisted_str(output: &mut Vec<u8>, value: &str) -> io::Result<()> {
+    let len = u32::try_from(value.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "persisted string too long"))?;
+    output.extend_from_slice(&len.to_le_bytes());
+    output.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+#[cfg(feature = "persist")]
+struct PersistedInput<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+#[cfg(feature = "persist")]
+impl<'a> PersistedInput<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn take(&mut self, len: usize) -> io::Result<&'a [u8]> {
+        let end = self.offset.checked_add(len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "persisted event length overflow",
+            )
+        })?;
+        let value = self.bytes.get(self.offset..end).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "truncated persisted event")
+        })?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn byte(&mut self) -> io::Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> io::Result<u32> {
+        let bytes: [u8; 4] = self
+            .take(4)?
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid u32"))?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn string(&mut self) -> io::Result<String> {
+        let len = usize::try_from(self.u32()?)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid string length"))?;
+        String::from_utf8(self.take(len)?.to_vec())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    fn pairs(&mut self) -> io::Result<Vec<(String, String)>> {
+        let count = usize::try_from(self.u32()?)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid pair count"))?;
+        let mut pairs = Vec::with_capacity(count.min(1024));
+        for _ in 0..count {
+            pairs.push((self.string()?, self.string()?));
+        }
+        Ok(pairs)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+}
+
 trait Message {
     fn encode_into_vec<W: Write>(&self, writer: &mut W) -> io::Result<()>;
     fn encoded_len(&self) -> usize;

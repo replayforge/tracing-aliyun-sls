@@ -20,6 +20,15 @@ pub(super) struct Signature {
 
 impl Signer {
     pub fn sign(&self, encoded_len: usize, encoded: &[u8]) -> Signature {
+        self.sign_resource(encoded_len, encoded, &self.canonicalized_resource)
+    }
+
+    pub fn sign_resource(
+        &self,
+        encoded_len: usize,
+        encoded: &[u8],
+        canonicalized_resource: &str,
+    ) -> Signature {
         let mut mac = self.hmac.clone();
 
         let date = Timestamp::now()
@@ -74,7 +83,7 @@ impl Signer {
         //
         // QUERY_STRING是URL中请求参数按字典顺序排序后的字符串，其中参数名和值之间用=相隔组成字符串，并对参数名-值对按照字典顺序升序排序，然后以&符号连接构成字符串。其公式化描述如下：
         // QUERY_STRING = "KEY1=VALUE1" + "&" + "KEY2=VALUE2"
-        mac.update(self.canonicalized_resource.as_bytes());
+        mac.update(canonicalized_resource.as_bytes());
         let authorization = BASE64_STANDARD.encode(mac.finalize().into_bytes());
         let authorization = format!("LOG {}:{}", self.access_key, authorization);
 

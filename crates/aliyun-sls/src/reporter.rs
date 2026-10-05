@@ -17,6 +17,11 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(feature = "persist")]
+use crate::persistence::{AdmissionFailure, PersistenceSender, PersistentBatch};
+#[cfg(feature = "persist")]
+pub use crate::persistence::{PersistenceConfig, PersistenceError};
+
 type Item = (Arc<LogGroupMetadata>, Log);
 pub(crate) type Producer = Sender<Item>;
 type Consumer = Receiver<Item>;
@@ -27,6 +32,17 @@ trait LogSink: Clone + Send + Sync + 'static {
         &'a self,
         metadata: &'a LogGroupMetadata,
         logs: &'a [Log],
+    ) -> Pin<Box<dyn Future<Output = Result<(), SlsClientError>> + Send + 'a>>;
+}
+
+#[cfg(feature = "persist")]
+trait PersistentLogSink: Clone + Send + Sync + 'static {
+    fn send_idempotent<'a>(
+        &'a self,
+        metadata: &'a LogGroupMetadata,
+        logs: &'a [Log],
+        spool_id: &'a [u8],
+        sequence_id: u64,
     ) -> Pin<Box<dyn Future<Output = Result<(), SlsClientError>> + Send + 'a>>;
 }
 
@@ -72,16 +88,24 @@ pub struct ReporterBuilder {
     config: ReporterConfig,
 }
 
-/// Result of attempting to enqueue one log.
+/// Result of attempting to admit one log.
+///
+/// Without persistent mode, admission means enqueueing in memory. With a
+/// reporter built by [`ReporterBuilder::build_with_persistence`], `Accepted`
+/// means the SQLite transaction committed before the call returned.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ReportResult {
-    /// The log was accepted into the bounded queue.
+    /// The log was accepted into memory or committed to the persistent spool.
     Accepted,
     /// The bounded queue had no available capacity.
     Full,
     /// The reporter has stopped accepting logs.
     Closed,
+    /// The persistence command queue was full or closed, the event exceeded a
+    /// configured limit, or SQLite failed before commit.
+    #[cfg(feature = "persist")]
+    PersistenceFailed,
 }
 
 /// A point-in-time copy of reporter counters.
@@ -108,10 +132,46 @@ pub struct ReporterStatsSnapshot {
     pub send_failed: u64,
     /// Logs larger than the configured maximum batch size.
     pub oversized: u64,
-    /// Logs dropped at admission, after send failure, or at shutdown deadline.
+    /// Logs dropped at admission, by persistence retention, after send failure,
+    /// or at shutdown deadline.
     pub dropped: u64,
-    /// Logs currently waiting in the bounded admission queue.
+    /// Logs currently waiting in the bounded in-memory or persistence command
+    /// queue. Persistent rows already committed to SQLite are reported by
+    /// `persistence_pending_rows`.
     pub queue_depth: u64,
+    /// Logs durably committed to the persistent spool.
+    #[cfg(feature = "persist")]
+    pub persistence_committed: u64,
+    /// Logs rejected because persistent admission or SQLite failed.
+    #[cfg(feature = "persist")]
+    pub persistence_failed: u64,
+    /// Rows evicted by the configured maximum event count.
+    #[cfg(feature = "persist")]
+    pub persistence_evicted_count: u64,
+    /// Rows evicted by the configured maximum age.
+    #[cfg(feature = "persist")]
+    pub persistence_evicted_age: u64,
+    /// Rows evicted to enforce the persistence storage capacity.
+    #[cfg(feature = "persist")]
+    pub persistence_evicted_storage: u64,
+    /// Payload bytes removed while enforcing persistence limits.
+    #[cfg(feature = "persist")]
+    pub persistence_evicted_bytes: u64,
+    /// Rows decoded and recovered when the persistent spool was opened.
+    #[cfg(feature = "persist")]
+    pub persistence_recovered_rows: u64,
+    /// Rows currently pending in the persistent spool.
+    #[cfg(feature = "persist")]
+    pub persistence_pending_rows: u64,
+    /// Serialized event bytes currently pending in the persistent spool.
+    #[cfg(feature = "persist")]
+    pub persistence_pending_bytes: u64,
+    /// Recovered logs delivered from a batch assigned before this process.
+    #[cfg(feature = "persist")]
+    pub persistence_replayed: u64,
+    /// Persistent upload cycles that ended with the durable batch still pending.
+    #[cfg(feature = "persist")]
+    pub persistence_failed_cycles: u64,
 }
 
 /// A reporter for batching and sending logs to the SLS service.
@@ -119,6 +179,8 @@ pub struct ReporterStatsSnapshot {
 pub struct Reporter {
     state: Arc<State>,
     pub(crate) producer: Arc<Producer>,
+    #[cfg(feature = "persist")]
+    persistence: Option<Arc<PersistenceSender>>,
     consumer: Arc<Mutex<Option<Consumer>>>,
     client: SlsClient,
     config: ReporterConfig,
@@ -131,6 +193,8 @@ pub struct Reporting {
     consumer: Consumer,
     client: SlsClient,
     config: ReporterConfig,
+    #[cfg(feature = "persist")]
+    persistence: Option<Arc<PersistenceSender>>,
     log_vec_capacity: usize,
     log_group_capacity: usize,
     vec_pool_capacity: usize,
@@ -139,25 +203,47 @@ pub struct Reporting {
 }
 
 #[derive(Default)]
-struct Stats {
-    received: AtomicU64,
-    accepted: AtomicU64,
-    queue_full: AtomicU64,
-    queue_closed: AtomicU64,
-    sent: AtomicU64,
-    retried: AtomicU64,
-    batches_sent: AtomicU64,
-    batches_failed: AtomicU64,
-    send_failed: AtomicU64,
-    oversized: AtomicU64,
-    dropped: AtomicU64,
-    queue_depth: AtomicU64,
+pub(crate) struct Stats {
+    pub(crate) received: AtomicU64,
+    pub(crate) accepted: AtomicU64,
+    pub(crate) queue_full: AtomicU64,
+    pub(crate) queue_closed: AtomicU64,
+    pub(crate) sent: AtomicU64,
+    pub(crate) retried: AtomicU64,
+    pub(crate) batches_sent: AtomicU64,
+    pub(crate) batches_failed: AtomicU64,
+    pub(crate) send_failed: AtomicU64,
+    pub(crate) oversized: AtomicU64,
+    pub(crate) dropped: AtomicU64,
+    pub(crate) queue_depth: AtomicU64,
+    #[cfg(feature = "persist")]
+    pub(crate) persistence_committed: AtomicU64,
+    #[cfg(feature = "persist")]
+    pub(crate) persistence_failed: AtomicU64,
+    #[cfg(feature = "persist")]
+    pub(crate) persistence_evicted_count: AtomicU64,
+    #[cfg(feature = "persist")]
+    pub(crate) persistence_evicted_age: AtomicU64,
+    #[cfg(feature = "persist")]
+    pub(crate) persistence_evicted_storage: AtomicU64,
+    #[cfg(feature = "persist")]
+    pub(crate) persistence_evicted_bytes: AtomicU64,
+    #[cfg(feature = "persist")]
+    pub(crate) persistence_recovered_rows: AtomicU64,
+    #[cfg(feature = "persist")]
+    pub(crate) persistence_pending_rows: AtomicU64,
+    #[cfg(feature = "persist")]
+    pub(crate) persistence_pending_bytes: AtomicU64,
+    #[cfg(feature = "persist")]
+    pub(crate) persistence_replayed: AtomicU64,
+    #[cfg(feature = "persist")]
+    pub(crate) persistence_failed_cycles: AtomicU64,
 }
 
-struct State {
+pub(crate) struct State {
     is_reporting: AtomicBool,
     is_closing: AtomicBool,
-    stats: Stats,
+    pub(crate) stats: Stats,
 }
 
 struct PendingBatch {
@@ -202,6 +288,19 @@ impl LogSink for SlsClient {
         logs: &'a [Log],
     ) -> Pin<Box<dyn Future<Output = Result<(), SlsClientError>> + Send + 'a>> {
         Box::pin(self.try_put_log(metadata, logs))
+    }
+}
+
+#[cfg(feature = "persist")]
+impl PersistentLogSink for SlsClient {
+    fn send_idempotent<'a>(
+        &'a self,
+        metadata: &'a LogGroupMetadata,
+        logs: &'a [Log],
+        spool_id: &'a [u8],
+        sequence_id: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SlsClientError>> + Send + 'a>> {
+        Box::pin(self.try_put_log_idempotent(metadata, logs, spool_id, sequence_id))
     }
 }
 
@@ -365,10 +464,54 @@ impl ReporterBuilder {
         Reporter {
             state: Arc::new(State::default()),
             producer: Arc::new(producer),
+            #[cfg(feature = "persist")]
+            persistence: None,
             consumer: Arc::new(Mutex::new(Some(consumer))),
             client: self.client,
             config: self.config,
         }
+    }
+
+    /// Build a reporter whose successful admission is committed to SQLite.
+    ///
+    /// This is the runtime opt-in required in addition to Cargo feature
+    /// `persist`. The method starts one dedicated SQLite writer thread and
+    /// validates that an existing spool belongs to this client's endpoint,
+    /// project, and logstore.
+    ///
+    /// SQLite uses WAL mode, `synchronous=NORMAL`, and `auto_vacuum=NONE`.
+    /// `NORMAL` protects committed rows from ordinary process termination, but
+    /// does not guarantee survival across power loss, an operating-system
+    /// crash, storage failure, or filesystem/hardware write-cache faults.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError`] for invalid limits, path or permission
+    /// failures, incompatible/corrupt state, destination mismatch, SQLite
+    /// setup failure, or failure to start the writer.
+    #[cfg(feature = "persist")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "persist")))]
+    pub fn build_with_persistence(
+        self,
+        persistence_config: PersistenceConfig,
+    ) -> Result<Reporter, PersistenceError> {
+        let (producer, consumer) = async_channel::bounded(self.config.queue_capacity.max(1));
+        let state = Arc::new(State::default());
+        let destination_fingerprint = self.client.persistence_destination_fingerprint();
+        let persistence = PersistenceSender::start(
+            persistence_config,
+            self.config.queue_capacity,
+            destination_fingerprint,
+            state.clone(),
+        )?;
+        Ok(Reporter {
+            state,
+            producer: Arc::new(producer),
+            persistence: Some(persistence),
+            consumer: Arc::new(Mutex::new(Some(consumer))),
+            client: self.client,
+            config: self.config,
+        })
     }
 }
 
@@ -416,6 +559,8 @@ impl Reporter {
             consumer,
             client: self.client.clone(),
             config: self.config.clone(),
+            #[cfg(feature = "persist")]
+            persistence: self.persistence.clone(),
             log_vec_capacity: LOG_VEC_DEFAULT_CAPACITY,
             log_group_capacity: LOG_GROUP_DEFAULT_CAPACITY,
             vec_pool_capacity: VEC_POOL_DEFAULT_CAPACITY,
@@ -431,7 +576,13 @@ impl Reporter {
         let _ = self.try_report(metadata, log);
     }
 
-    /// Attempt to enqueue a log without blocking.
+    /// Attempt to admit a log.
+    ///
+    /// In memory-only mode this is a nonblocking bounded-channel `try_send`.
+    /// In persistent mode it never waits for network delivery or queue
+    /// capacity, but it synchronously waits for the dedicated writer to commit
+    /// the SQLite transaction. Queue or SQLite errors immediately return
+    /// [`ReportResult::PersistenceFailed`].
     pub fn try_report(&self, metadata: Arc<LogGroupMetadata>, log: Log) -> ReportResult {
         self.state.stats.received.fetch_add(1, Ordering::Relaxed);
         if self.state.is_closing() {
@@ -441,6 +592,51 @@ impl Reporter {
                 .fetch_add(1, Ordering::Relaxed);
             self.state.stats.dropped.fetch_add(1, Ordering::Relaxed);
             return ReportResult::Closed;
+        }
+        #[cfg(feature = "persist")]
+        if let Some(persistence) = &self.persistence {
+            if calc_log_group_metadata_encoded_len(&metadata)
+                .saturating_add(calc_log_group_log_encoded_len(&log))
+                > self.config.batch_max_bytes
+            {
+                self.state.stats.oversized.fetch_add(1, Ordering::Relaxed);
+                self.state
+                    .stats
+                    .persistence_failed
+                    .fetch_add(1, Ordering::Relaxed);
+                self.state.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                return ReportResult::PersistenceFailed;
+            }
+            return match persistence.commit(metadata, log, &self.state) {
+                Ok(()) => {
+                    self.state.stats.accepted.fetch_add(1, Ordering::Relaxed);
+                    self.state
+                        .stats
+                        .persistence_committed
+                        .fetch_add(1, Ordering::Relaxed);
+                    ReportResult::Accepted
+                }
+                Err(failure) => {
+                    match failure {
+                        AdmissionFailure::Full => {
+                            self.state.stats.queue_full.fetch_add(1, Ordering::Relaxed);
+                        }
+                        AdmissionFailure::Closed => {
+                            self.state
+                                .stats
+                                .queue_closed
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        AdmissionFailure::Store => {}
+                    }
+                    self.state
+                        .stats
+                        .persistence_failed
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.state.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                    ReportResult::PersistenceFailed
+                }
+            };
         }
         match self.producer.try_send((metadata, log)) {
             Ok(()) => {
@@ -464,7 +660,11 @@ impl Reporter {
         }
     }
 
-    /// Return a point-in-time snapshot of reporter counters.
+    /// Return a point-in-time snapshot of process-local reporter counters.
+    ///
+    /// Persistent snapshots include committed/failed admission, retention
+    /// evictions and bytes, recovered/replayed rows, current pending rows and
+    /// serialized bytes, and upload cycles that left a batch durable.
     pub fn stats(&self) -> ReporterStatsSnapshot {
         self.state.snapshot()
     }
@@ -512,12 +712,28 @@ impl Reporting {
             consumer,
             client,
             config,
+            #[cfg(feature = "persist")]
+            persistence,
             drain_timer,
             shutdown_signal,
             log_vec_capacity,
             log_group_capacity,
             vec_pool_capacity,
         } = self;
+
+        #[cfg(feature = "persist")]
+        if let Some(persistence) = persistence {
+            let work_fut =
+                persistent_worker(persistence, client, config, state.clone(), shutdown_rx);
+            let shutdown_fut = async move {
+                shutdown_signal.await;
+                state.begin_close();
+                producer.close();
+                let _ = shutdown_tx.try_send(());
+            };
+            join!(work_fut, shutdown_fut);
+            return;
+        }
 
         let mut vec_pool = Vec::with_capacity(vec_pool_capacity);
         vec_pool.resize_with(vec_pool_capacity, || Vec::with_capacity(log_vec_capacity));
@@ -547,6 +763,250 @@ impl Reporting {
         };
         join!(work_fut, shutdown_fut);
     }
+}
+
+#[cfg(feature = "persist")]
+async fn persistent_worker(
+    persistence: Arc<PersistenceSender>,
+    client: SlsClient,
+    config: ReporterConfig,
+    state: Arc<State>,
+    shutdown: Receiver<()>,
+) {
+    loop {
+        if shutdown.try_recv().is_ok() {
+            break;
+        }
+        let batch = match next_persistent_batch(&persistence, &config, &shutdown).await {
+            Ok(Some(batch)) => batch,
+            Ok(None) => break,
+            Err(_) => {
+                state
+                    .stats
+                    .persistence_failed_cycles
+                    .fetch_add(1, Ordering::Relaxed);
+                let wait = sleep(persistent_cycle_delay(&config)).fuse();
+                let stop = shutdown.recv().fuse();
+                futures_util::pin_mut!(wait, stop);
+                if matches!(
+                    futures_util::future::select(wait, stop).await,
+                    futures_util::future::Either::Right(_)
+                ) {
+                    break;
+                }
+                continue;
+            }
+        };
+        let send = persistent_send_cycle(&client, &batch, &config, &state).fuse();
+        let stop = shutdown.recv().fuse();
+        futures_util::pin_mut!(send, stop);
+        match futures_util::future::select(send, stop).await {
+            futures_util::future::Either::Left((success, _)) => {
+                let finish = finish_persistent_cycle(&persistence, &batch, success, &state).fuse();
+                let stop = shutdown.recv().fuse();
+                futures_util::pin_mut!(finish, stop);
+                if matches!(
+                    futures_util::future::select(finish, stop).await,
+                    futures_util::future::Either::Right(_)
+                ) {
+                    break;
+                }
+                if !success {
+                    let wait = sleep(persistent_cycle_delay(&config)).fuse();
+                    let stop = shutdown.recv().fuse();
+                    futures_util::pin_mut!(wait, stop);
+                    if matches!(
+                        futures_util::future::select(wait, stop).await,
+                        futures_util::future::Either::Right(_)
+                    ) {
+                        break;
+                    }
+                }
+            }
+            futures_util::future::Either::Right(_) => break,
+        }
+    }
+    persistent_graceful_shutdown(persistence, client, config, state).await;
+}
+
+#[cfg(feature = "persist")]
+async fn next_persistent_batch(
+    persistence: &PersistenceSender,
+    config: &ReporterConfig,
+    shutdown: &Receiver<()>,
+) -> Result<Option<PersistentBatch>, PersistenceError> {
+    let next = persistence
+        .next_batch(config.batch_max_count, config.batch_max_bytes, false)
+        .fuse();
+    let stop = shutdown.recv().fuse();
+    futures_util::pin_mut!(next, stop);
+    let initial = match futures_util::future::select(next, stop).await {
+        futures_util::future::Either::Left((result, _)) => result?,
+        futures_util::future::Either::Right(_) => return Ok(None),
+    };
+    if let Some(batch) = initial {
+        return Ok(Some(batch));
+    }
+    let notified = persistence.notified().fuse();
+    let stop = shutdown.recv().fuse();
+    futures_util::pin_mut!(notified, stop);
+    if matches!(
+        futures_util::future::select(notified, stop).await,
+        futures_util::future::Either::Right(_)
+    ) {
+        return Ok(None);
+    }
+
+    let linger = sleep(jittered_linger_duration(
+        config.linger,
+        config.linger_jitter_percent,
+    ))
+    .fuse();
+    futures_util::pin_mut!(linger);
+    loop {
+        let next = persistence
+            .next_batch(config.batch_max_count, config.batch_max_bytes, false)
+            .fuse();
+        let stop = shutdown.recv().fuse();
+        futures_util::pin_mut!(next, stop);
+        let candidate = match futures_util::future::select(next, stop).await {
+            futures_util::future::Either::Left((result, _)) => result?,
+            futures_util::future::Either::Right(_) => return Ok(None),
+        };
+        if let Some(batch) = candidate {
+            return Ok(Some(batch));
+        }
+        let notified = persistence.notified().fuse();
+        let stop = shutdown.recv().fuse();
+        futures_util::pin_mut!(notified, stop);
+        select! {
+            _ = notified => continue,
+            _ = stop => return Ok(None),
+            _ = linger => {
+                let next = persistence
+                    .next_batch(config.batch_max_count, config.batch_max_bytes, true)
+                    .fuse();
+                let stop = shutdown.recv().fuse();
+                futures_util::pin_mut!(next, stop);
+                return match futures_util::future::select(next, stop).await {
+                    futures_util::future::Either::Left((result, _)) => result,
+                    futures_util::future::Either::Right(_) => Ok(None),
+                };
+            }
+        }
+    }
+}
+
+#[cfg(feature = "persist")]
+async fn persistent_send_cycle<S: PersistentLogSink>(
+    client: &S,
+    batch: &PersistentBatch,
+    config: &ReporterConfig,
+    state: &State,
+) -> bool {
+    for attempt in 1..=config.retry_max_attempts {
+        match client
+            .send_idempotent(
+                &batch.metadata,
+                &batch.logs,
+                &batch.spool_id,
+                batch.sequence_id,
+            )
+            .await
+        {
+            Ok(()) => return true,
+            Err(error) if attempt < config.retry_max_attempts && is_retryable(&error) => {
+                state.stats.retried.fetch_add(1, Ordering::Relaxed);
+                sleep(retry_delay(config, attempt)).await;
+            }
+            Err(_) => break,
+        }
+    }
+    false
+}
+
+#[cfg(feature = "persist")]
+async fn finish_persistent_cycle(
+    persistence: &PersistenceSender,
+    batch: &PersistentBatch,
+    success: bool,
+    state: &State,
+) {
+    if success && persistence.acknowledge(batch.sequence_id).await.is_ok() {
+        let count = batch.logs.len() as u64;
+        state.stats.sent.fetch_add(count, Ordering::Relaxed);
+        state.stats.batches_sent.fetch_add(1, Ordering::Relaxed);
+        if batch.recovered_count != 0 {
+            state
+                .stats
+                .persistence_replayed
+                .fetch_add(batch.recovered_count as u64, Ordering::Relaxed);
+        }
+        return;
+    }
+    state.stats.batches_failed.fetch_add(1, Ordering::Relaxed);
+    if !success {
+        state
+            .stats
+            .send_failed
+            .fetch_add(batch.logs.len() as u64, Ordering::Relaxed);
+    }
+    state
+        .stats
+        .persistence_failed_cycles
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(feature = "persist")]
+async fn persistent_graceful_shutdown(
+    persistence: Arc<PersistenceSender>,
+    client: SlsClient,
+    config: ReporterConfig,
+    state: Arc<State>,
+) {
+    let deadline = sleep(config.shutdown_timeout).fuse();
+    futures_util::pin_mut!(deadline);
+    loop {
+        let next = persistence
+            .next_batch(config.batch_max_count, config.batch_max_bytes, true)
+            .fuse();
+        futures_util::pin_mut!(next);
+        let batch = match select! {
+            result = next => result.ok().flatten(),
+            _ = deadline => None,
+        } {
+            Some(batch) => batch,
+            None => return,
+        };
+        let send = persistent_send_cycle(&client, &batch, &config, &state).fuse();
+        futures_util::pin_mut!(send);
+        let success = select! {
+            result = send => result,
+            _ = deadline => return,
+        };
+        let finish = finish_persistent_cycle(&persistence, &batch, success, &state).fuse();
+        futures_util::pin_mut!(finish);
+        select! {
+            _ = finish => {},
+            _ = deadline => return,
+        }
+        if !success {
+            let delay = sleep(persistent_cycle_delay(&config)).fuse();
+            futures_util::pin_mut!(delay);
+            select! {
+                _ = delay => {},
+                _ = deadline => return,
+            }
+        }
+    }
+}
+
+#[cfg(feature = "persist")]
+fn persistent_cycle_delay(config: &ReporterConfig) -> Duration {
+    config
+        .retry_max_delay
+        .max(config.linger)
+        .max(Duration::from_millis(100))
 }
 
 impl<S: LogSink> BatchWorker<S> {
@@ -831,6 +1291,34 @@ impl State {
             oversized: self.stats.oversized.load(Ordering::Relaxed),
             dropped: self.stats.dropped.load(Ordering::Relaxed),
             queue_depth: self.stats.queue_depth.load(Ordering::Relaxed),
+            #[cfg(feature = "persist")]
+            persistence_committed: self.stats.persistence_committed.load(Ordering::Relaxed),
+            #[cfg(feature = "persist")]
+            persistence_failed: self.stats.persistence_failed.load(Ordering::Relaxed),
+            #[cfg(feature = "persist")]
+            persistence_evicted_count: self.stats.persistence_evicted_count.load(Ordering::Relaxed),
+            #[cfg(feature = "persist")]
+            persistence_evicted_age: self.stats.persistence_evicted_age.load(Ordering::Relaxed),
+            #[cfg(feature = "persist")]
+            persistence_evicted_storage: self
+                .stats
+                .persistence_evicted_storage
+                .load(Ordering::Relaxed),
+            #[cfg(feature = "persist")]
+            persistence_evicted_bytes: self.stats.persistence_evicted_bytes.load(Ordering::Relaxed),
+            #[cfg(feature = "persist")]
+            persistence_recovered_rows: self
+                .stats
+                .persistence_recovered_rows
+                .load(Ordering::Relaxed),
+            #[cfg(feature = "persist")]
+            persistence_pending_rows: self.stats.persistence_pending_rows.load(Ordering::Relaxed),
+            #[cfg(feature = "persist")]
+            persistence_pending_bytes: self.stats.persistence_pending_bytes.load(Ordering::Relaxed),
+            #[cfg(feature = "persist")]
+            persistence_replayed: self.stats.persistence_replayed.load(Ordering::Relaxed),
+            #[cfg(feature = "persist")]
+            persistence_failed_cycles: self.stats.persistence_failed_cycles.load(Ordering::Relaxed),
         }
     }
 }
@@ -944,6 +1432,19 @@ mod tests {
                     })
                 }
             })
+        }
+    }
+
+    #[cfg(feature = "persist")]
+    impl PersistentLogSink for FakeSink {
+        fn send_idempotent<'a>(
+            &'a self,
+            metadata: &'a LogGroupMetadata,
+            logs: &'a [Log],
+            _spool_id: &'a [u8],
+            _sequence_id: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<(), SlsClientError>> + Send + 'a>> {
+            self.send(metadata, logs)
         }
     }
 
@@ -1277,5 +1778,254 @@ mod tests {
         let (metadata, log) = item(1);
         assert_eq!(reporter.try_report(metadata, log), ReportResult::Closed);
         assert_eq!(reporter.stats().queue_closed, 1);
+    }
+
+    #[cfg(feature = "persist")]
+    fn persistence_test_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join(format!(
+                "aliyun-sls-reporter-{name}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("clock after epoch")
+                    .as_nanos()
+            ))
+            .join("spool.sqlite3")
+    }
+
+    #[cfg(feature = "persist")]
+    #[test]
+    fn persistent_acceptance_acknowledges_a_visible_commit() {
+        let path = persistence_test_path("commit");
+        let reporter = Reporter::builder(client())
+            .with_queue_capacity(2)
+            .build_with_persistence(PersistenceConfig::new(1024 * 1024).path(path.clone()))
+            .expect("build persistent reporter");
+        let (metadata, log) = item(1);
+
+        assert_eq!(reporter.try_report(metadata, log), ReportResult::Accepted);
+
+        let connection = rusqlite::Connection::open(&path).expect("open committed spool");
+        let rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pending_events", [], |row| row.get(0))
+            .expect("read committed row");
+        assert_eq!(rows, 1);
+        assert_eq!(reporter.stats().persistence_committed, 1);
+        assert_eq!(reporter.stats().persistence_pending_rows, 1);
+        drop(connection);
+        drop(reporter);
+        let recovered = Reporter::builder(client())
+            .build_with_persistence(PersistenceConfig::new(1024 * 1024).path(path.clone()))
+            .expect("reopen persistent reporter");
+        assert_eq!(recovered.stats().persistence_recovered_rows, 1);
+        assert_eq!(recovered.stats().persistence_pending_rows, 1);
+        assert_eq!(recovered.stats().persistence_committed, 0);
+        drop(recovered);
+        let _ = std::fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    #[cfg(feature = "persist")]
+    #[test]
+    fn persistent_storage_eviction_updates_drop_counters() {
+        let path = persistence_test_path("storage-eviction");
+        let reporter = Reporter::builder(client())
+            .build_with_persistence(PersistenceConfig::new(128 * 1024).path(path.clone()))
+            .expect("build persistent reporter");
+        for index in 1..=2 {
+            let metadata = Arc::new(LogGroupMetadata::new());
+            let log = Log::new(index, None)
+                .with(MayStaticKey::from_static("message"), "x".repeat(70 * 1024));
+            assert_eq!(reporter.try_report(metadata, log), ReportResult::Accepted);
+        }
+
+        let stats = reporter.stats();
+        assert_eq!(stats.persistence_committed, 2);
+        assert_eq!(stats.persistence_evicted_storage, 1);
+        assert_eq!(stats.persistence_pending_rows, 1);
+        assert_eq!(stats.dropped, 1);
+        drop(reporter);
+        let _ = std::fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    #[cfg(feature = "persist")]
+    #[test]
+    fn persistent_store_error_is_reported_without_retry() {
+        let path = persistence_test_path("error");
+        let reporter = Reporter::builder(client())
+            .build_with_persistence(PersistenceConfig::new(128 * 1024).path(path.clone()))
+            .expect("build persistent reporter");
+        let metadata = Arc::new(LogGroupMetadata::new());
+        let log =
+            Log::new(1, None).with(MayStaticKey::from_static("message"), "x".repeat(100 * 1024));
+
+        assert_eq!(
+            reporter.try_report(metadata, log),
+            ReportResult::PersistenceFailed
+        );
+        let stats = reporter.stats();
+        assert_eq!(stats.accepted, 0);
+        assert_eq!(stats.persistence_failed, 1);
+        assert_eq!(stats.dropped, 1);
+        assert_eq!(stats.persistence_pending_rows, 0);
+        drop(reporter);
+        let _ = std::fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    #[cfg(feature = "persist")]
+    #[test]
+    fn persistent_oversized_event_is_rejected_before_sqlite_admission() {
+        let path = persistence_test_path("oversized-admission");
+        let reporter = Reporter::builder(client())
+            .with_batch_max_bytes(1)
+            .build_with_persistence(PersistenceConfig::new(1024 * 1024).path(path.clone()))
+            .expect("build persistent reporter");
+        let (metadata, log) = item(1);
+
+        assert_eq!(
+            reporter.try_report(metadata, log),
+            ReportResult::PersistenceFailed
+        );
+
+        let connection = rusqlite::Connection::open(&path).expect("open spool");
+        let rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pending_events", [], |row| row.get(0))
+            .expect("count rows");
+        assert_eq!(rows, 0);
+        let stats = reporter.stats();
+        assert_eq!(stats.oversized, 1);
+        assert_eq!(stats.persistence_failed, 1);
+        assert_eq!(stats.dropped, 1);
+        assert_eq!(stats.accepted, 0);
+        drop(connection);
+        drop(reporter);
+        let _ = std::fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    #[cfg(feature = "persist")]
+    #[tokio::test]
+    async fn persistent_shutdown_retains_durable_rows_without_dropping() {
+        let path = persistence_test_path("shutdown-retains");
+        let reporter = Reporter::builder(client())
+            .with_shutdown_timeout(Duration::ZERO)
+            .build_with_persistence(PersistenceConfig::new(1024 * 1024).path(path.clone()))
+            .expect("build persistent reporter");
+        let (metadata, log) = item(1);
+        assert_eq!(reporter.try_report(metadata, log), ReportResult::Accepted);
+        let reporting = reporter
+            .reporting_default()
+            .await
+            .expect("reporting handle");
+
+        reporting.with_graceful_shutdown(async {}).start().await;
+
+        let connection = rusqlite::Connection::open(&path).expect("open spool");
+        let pending: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pending_events", [], |row| row.get(0))
+            .expect("count pending");
+        assert_eq!(pending, 1);
+        assert_eq!(reporter.stats().dropped, 0);
+        assert_eq!(reporter.stats().persistence_pending_rows, 1);
+        drop(connection);
+        drop(reporter);
+        let _ = std::fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    #[cfg(feature = "persist")]
+    #[tokio::test]
+    async fn persistent_failed_cycle_counts_failure_without_drop() {
+        let persistence = PersistenceSender::disconnected_for_test();
+        let state = State::default();
+        let (metadata, log) = item(1);
+        let batch = PersistentBatch {
+            sequence_id: 1,
+            spool_id: vec![1].into_boxed_slice(),
+            metadata: (*metadata).clone(),
+            logs: vec![log],
+            recovered_count: 0,
+        };
+
+        finish_persistent_cycle(&persistence, &batch, false, &state).await;
+
+        let stats = state.snapshot();
+        assert_eq!(stats.batches_failed, 1);
+        assert_eq!(stats.send_failed, 1);
+        assert_eq!(stats.persistence_failed_cycles, 1);
+        assert_eq!(stats.dropped, 0);
+    }
+
+    #[cfg(feature = "persist")]
+    async fn assigned_persistent_batch(
+        name: &str,
+    ) -> (std::path::PathBuf, Arc<PersistenceSender>, PersistentBatch) {
+        let path = persistence_test_path(name);
+        let state = Arc::new(State::default());
+        let persistence = PersistenceSender::start(
+            PersistenceConfig::new(1024 * 1024).path(path.clone()),
+            2,
+            b"fake-persistent-sink".to_vec().into_boxed_slice(),
+            state.clone(),
+        )
+        .expect("start persistence");
+        let (metadata, log) = item(1);
+        assert!(
+            persistence.commit(metadata, log, &state).is_ok(),
+            "commit event"
+        );
+        let batch = persistence
+            .next_batch(1, usize::MAX, true)
+            .await
+            .expect("assign batch")
+            .expect("assigned batch");
+        (path, persistence, batch)
+    }
+
+    #[cfg(feature = "persist")]
+    #[tokio::test]
+    async fn persistent_fake_503_sink_retains_assigned_batch() {
+        let (path, persistence, batch) = assigned_persistent_batch("fake-503").await;
+        let state = State::default();
+        let sink = FakeSink::new([503, 503]);
+        let config = ReporterConfig::default()
+            .with_retry_max_attempts(2)
+            .with_retry_base_delay(Duration::ZERO)
+            .with_retry_max_delay(Duration::ZERO);
+
+        assert!(!persistent_send_cycle(&sink, &batch, &config, &state).await);
+        let retained = persistence
+            .next_batch(1, usize::MAX, true)
+            .await
+            .expect("reload retained batch")
+            .expect("batch remains after 503");
+        assert_eq!(retained.sequence_id, batch.sequence_id);
+        assert_eq!(retained.logs, batch.logs);
+        drop(persistence);
+        let _ = std::fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    #[cfg(feature = "persist")]
+    #[tokio::test]
+    async fn persistent_fake_timeout_retains_assigned_batch() {
+        let (path, persistence, batch) = assigned_persistent_batch("fake-timeout").await;
+        let state = State::default();
+        let sink = FakeSink::new([200]).with_delay(Duration::from_secs(1));
+        let config = ReporterConfig::default().with_retry_max_attempts(1);
+        let send = persistent_send_cycle(&sink, &batch, &config, &state).fuse();
+        let timeout = sleep(Duration::from_millis(5)).fuse();
+        futures_util::pin_mut!(send, timeout);
+
+        assert!(matches!(
+            futures_util::future::select(send, timeout).await,
+            futures_util::future::Either::Right(_)
+        ));
+        let retained = persistence
+            .next_batch(1, usize::MAX, true)
+            .await
+            .expect("reload retained batch")
+            .expect("batch remains after timeout");
+        assert_eq!(retained.sequence_id, batch.sequence_id);
+        assert_eq!(retained.logs, batch.logs);
+        drop(persistence);
+        let _ = std::fs::remove_dir_all(path.parent().expect("temporary parent"));
     }
 }
