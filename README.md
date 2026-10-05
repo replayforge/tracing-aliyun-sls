@@ -210,4 +210,16 @@ storage bytes, and producer thread count. It does not fake successful network
 delivery.
 
 ## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this work by you, as defined in the Apache-2.0 license, shall
+be dual licensed as above, without any additional terms or conditions.
+
 [![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Flightsing%2Ftracing-aliyun-sls.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2Flightsing%2Ftracing-aliyun-sls?ref=badge_large)

@@ -237,6 +237,12 @@ The upstream repository contains no license text files in its current tree or
 history, but its existing `MIT OR Apache-2.0` manifest declaration, author, and
 repository attribution were preserved. No copyleft dependency was introduced.
 
+The fork now ships `LICENSE-MIT` and `LICENSE-APACHE` at the repository root,
+matching the existing `MIT OR Apache-2.0` declaration. `LICENSE-APACHE` is the
+unmodified text from `https://www.apache.org/licenses/LICENSE-2.0.txt`;
+`LICENSE-MIT` names the original author from the manifest `authors` field and
+the project's contributors.
+
 ## Validation performed
 
 Successful commands:
