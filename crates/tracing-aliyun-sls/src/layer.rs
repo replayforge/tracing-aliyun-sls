@@ -22,6 +22,8 @@ use tracing_subscriber::{
     registry::LookupSpan,
 };
 
+const INTERNAL_TARGET: &str = "tracing_aliyun_sls_internal";
+
 /// A [`Layer`] that logs to a [`Reporter`].
 ///
 /// [`Layer`]: tracing_subscriber::layer::Layer
@@ -100,7 +102,7 @@ impl<S, FT, T, E> Layer<S, FT, T, E> {
             format: self.format.with_timer(timer),
             record_tags: self.record_tags,
             record_event: self.record_event,
-            record_span: self.record_span,
+            record_span: self.record_span.with_time(),
             instance_id: self.instance_id,
             log_internal_errors: self.log_internal_errors,
             _inner: self._inner,
@@ -224,6 +226,17 @@ impl<S, FT, T, E> Layer<S, FT, T, E> {
             ..self
         }
     }
+
+    /// Sets whether internal layer errors are written directly to standard error.
+    ///
+    /// These diagnostics do not use `tracing`, which prevents them from being
+    /// recursively processed by this layer.
+    pub fn with_internal_error_logging(self, log_internal_errors: bool) -> Self {
+        Self {
+            log_internal_errors,
+            ..self
+        }
+    }
 }
 
 impl<S, FT, T, E> layer::Layer<S> for Layer<S, FT, T, E>
@@ -234,12 +247,19 @@ where
     E: RecordEvent<S> + 'static,
 {
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+        if is_internal(attrs.metadata()) {
+            return;
+        }
+
+        let Some(span) = ctx.span(id) else {
+            self.report_missing_span("on_new_span", id);
+            return;
+        };
+
         let mut metadata = self.create_metadata(attrs.metadata());
         attrs
             .values()
             .record(&mut self.record_tags.make_visitor(&mut metadata));
-
-        let span = ctx.span(id).expect("Span not found, this is a bug");
 
         metadata.add_tag(
             MayStaticKey::from_static("span-id"),
@@ -275,7 +295,13 @@ where
     }
 
     fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
-        let span = ctx.span(id).expect("Span not found, this is a bug");
+        let Some(span) = ctx.span(id) else {
+            self.report_missing_span("on_record", id);
+            return;
+        };
+        if is_internal(span.metadata()) {
+            return;
+        }
 
         let mut metadata =
             if let Some(metadata) = span.extensions_mut().remove::<Arc<LogGroupMetadata>>() {
@@ -289,6 +315,10 @@ where
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+        if is_internal(event.metadata()) {
+            return;
+        }
+
         let metadata = match ctx.lookup_current() {
             Some(span) => self.get_or_create_metadata(&span, event.metadata()),
             None => Arc::new(self.create_metadata(event.metadata())),
@@ -305,12 +335,21 @@ where
         if self.record_span.trace_enter()
             || self.record_span.trace_close() && self.record_span.timing
         {
-            let span = ctx.span(id).expect("Span not found, this is a bug");
-            let mut extensions = span.extensions_mut();
-            if let Some(timings) = extensions.get_mut::<Timings>() {
-                let now = Instant::now();
-                timings.idle += (now - timings.last).as_nanos() as u64;
-                timings.last = now;
+            let Some(span) = ctx.span(id) else {
+                self.report_missing_span("on_enter", id);
+                return;
+            };
+            if is_internal(span.metadata()) {
+                return;
+            }
+
+            {
+                let mut extensions = span.extensions_mut();
+                if let Some(timings) = extensions.get_mut::<Timings>() {
+                    let now = Instant::now();
+                    timings.idle += (now - timings.last).as_nanos() as u64;
+                    timings.last = now;
+                }
             }
 
             if self.record_span.trace_enter() {
@@ -327,12 +366,21 @@ where
         if self.record_span.trace_exit()
             || self.record_span.trace_close() && self.record_span.timing
         {
-            let span = ctx.span(id).expect("Span not found, this is a bug");
-            let mut extensions = span.extensions_mut();
-            if let Some(timings) = extensions.get_mut::<Timings>() {
-                let now = Instant::now();
-                timings.busy += (now - timings.last).as_nanos() as u64;
-                timings.last = now;
+            let Some(span) = ctx.span(id) else {
+                self.report_missing_span("on_exit", id);
+                return;
+            };
+            if is_internal(span.metadata()) {
+                return;
+            }
+
+            {
+                let mut extensions = span.extensions_mut();
+                if let Some(timings) = extensions.get_mut::<Timings>() {
+                    let now = Instant::now();
+                    timings.busy += (now - timings.last).as_nanos() as u64;
+                    timings.last = now;
+                }
             }
 
             if self.record_span.trace_exit() {
@@ -346,7 +394,14 @@ where
     }
 
     fn on_close(&self, id: Id, ctx: Context<'_, S>) {
-        let span = ctx.span(&id).expect("Span not found, this is a bug");
+        let Some(span) = ctx.span(&id) else {
+            self.report_missing_span("on_close", &id);
+            return;
+        };
+        if is_internal(span.metadata()) {
+            return;
+        }
+
         if self.record_span.trace_close() {
             let metadata = self.get_or_create_metadata(&span, span.metadata());
 
@@ -360,15 +415,10 @@ where
                     last,
                 } = *timing;
                 idle += (Instant::now() - last).as_nanos() as u64;
+                let (busy, idle) = timing_values(busy, idle);
 
-                log.insert(
-                    MayStaticKey::from_static("time.busy"),
-                    format_compact!("{}", TimingDisplay(idle)),
-                );
-                log.insert(
-                    MayStaticKey::from_static("time.idle"),
-                    format_compact!("{}", TimingDisplay(busy)),
-                );
+                log.insert(MayStaticKey::from_static("time.busy"), busy);
+                log.insert(MayStaticKey::from_static("time.idle"), idle);
             };
 
             self.reporter.report(metadata, log);
@@ -420,6 +470,27 @@ where
         }
         log_meta
     }
+
+    fn report_missing_span(&self, callback: &str, id: &Id) {
+        if self.log_internal_errors {
+            eprintln!("tracing-aliyun-sls: {callback} ignored missing span {id:?}");
+        }
+    }
+}
+
+fn is_internal(metadata: &Metadata<'_>) -> bool {
+    is_internal_target(metadata.target())
+}
+
+fn is_internal_target(target: &str) -> bool {
+    target == INTERNAL_TARGET
+}
+
+fn timing_values(busy: u64, idle: u64) -> (CompactString, CompactString) {
+    (
+        format_compact!("{}", TimingDisplay(busy)),
+        format_compact!("{}", TimingDisplay(idle)),
+    )
 }
 
 /// Returns a new [aliyun sls layer] that can be [composed] with other layers to
@@ -447,5 +518,25 @@ impl Timings {
             busy: 0,
             last: Instant::now(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timing_fields_keep_busy_and_idle_values() {
+        let (busy, idle) = timing_values(1_000, 2_000);
+
+        assert_eq!(busy, "1.00µs");
+        assert_eq!(idle, "2.00µs");
+    }
+
+    #[test]
+    fn internal_target_is_excluded_exactly() {
+        assert!(is_internal_target("tracing_aliyun_sls_internal"));
+        assert!(!is_internal_target("tracing_aliyun_sls_internal_child"));
+        assert!(!is_internal_target("application"));
     }
 }

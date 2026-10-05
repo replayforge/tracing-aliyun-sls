@@ -34,7 +34,7 @@ bitflags! {
         /// spans are ignored (this is the default)
         const NONE = 0;
         /// one event per enter/exit of a span
-        const ACTIVE = Self::NEW.bits() | Self::ENTER.bits();
+        const ACTIVE = Self::ENTER.bits() | Self::EXIT.bits();
         /// events at all points (new, enter, exit, drop)
         const FULL = Self::NEW.bits() | Self::ENTER.bits() | Self::EXIT.bits() | Self::CLOSE.bits();
     }
@@ -155,12 +155,18 @@ impl Default for RecordSpanConfig {
     fn default() -> Self {
         Self {
             kind: RecordSpan::NONE,
-            timing: false,
+            timing: true,
         }
     }
 }
 
 impl RecordSpanConfig {
+    pub(super) fn with_time(self) -> Self {
+        Self {
+            kind: self.kind,
+            timing: true,
+        }
+    }
     pub(super) fn without_time(self) -> Self {
         Self {
             kind: self.kind,
@@ -202,5 +208,27 @@ impl Display for TimingDisplay {
             t /= 1000.0;
         }
         write!(f, "{:.0}s", t * 1000.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_records_enter_and_exit_only() {
+        assert!(RecordSpan::ACTIVE.contains(RecordSpan::ENTER));
+        assert!(RecordSpan::ACTIVE.contains(RecordSpan::EXIT));
+        assert!(!RecordSpan::ACTIVE.contains(RecordSpan::NEW));
+        assert!(!RecordSpan::ACTIVE.contains(RecordSpan::CLOSE));
+    }
+
+    #[test]
+    fn timing_tracks_timestamp_configuration() {
+        let config = RecordSpanConfig::default();
+        assert!(config.timing);
+        let config = config.without_time();
+        assert!(!config.timing);
+        assert!(config.with_time().timing);
     }
 }
