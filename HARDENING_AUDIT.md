@@ -405,3 +405,233 @@ retaining it indefinitely. This is required to preserve host availability.
   external network access are intentionally not assumed.
 - Mutually exclusive feature flags prevent a meaningful stable
   `--all-features` build; CI should use the documented valid feature matrix.
+
+## Persistence addendum (2026-10-05)
+
+This addendum is the current state for builds using the optional `persist`
+feature and supersedes earlier memory-only statements where noted.
+
+### Why persistence was added
+
+The bounded memory reporter protects the host but necessarily loses accepted
+telemetry on process termination and drops new telemetry during a prolonged
+outage once memory capacity is exhausted. Optional persistence adds a bounded
+SQLite spool so successful admission can survive ordinary process termination,
+retry across SLS outages, and be recovered on restart without making durable
+storage mandatory for existing users.
+
+It addresses these persistence-specific issues:
+
+- accepted events previously had no restart recovery;
+- there was no durable identity for retrying an uncertain upload;
+- retention had no disk/count/age policy or eviction accounting;
+- a spool could otherwise be accidentally reused for another destination;
+- callers could not distinguish a SQLite admission failure from acceptance.
+
+### Architecture and changed invariant
+
+Feature off or runtime persistence off:
+
+```text
+producer -> bounded in-memory try_send -> grouped batches
+         -> up to max_in_flight uploads -> bounded retry -> SLS
+```
+
+This path preserves the original hardened invariant: no disk I/O, blocking
+channel send, retry sleep, compression, or network operation in admission.
+
+Feature `persist` plus `build_with_persistence`:
+
+```text
+producer -> bounded persistence command queue
+         -> one SQLite writer (WAL / NORMAL / auto_vacuum NONE)
+         -> pending row committed -> Accepted returned
+         -> one assigned durable batch / one upload lane
+         -> SLS route key + seqid retry
+         -> local SQLite acknowledgement deletes assigned rows
+```
+
+The invariant changes deliberately: persistent admission still never waits for
+network delivery or for queue capacity, but it synchronously waits for the
+dedicated writer's SQLite transaction. It can therefore block for storage I/O
+latency. A full/closed command queue, event/retention rejection, writer
+failure, or SQLite error immediately returns `PersistenceFailed`; no
+uncommitted event is reported as accepted.
+
+### Configuration and storage policy
+
+Persistence requires both the Cargo feature and runtime builder call.
+`PersistenceConfig::new(max_storage_bytes)` requires a nonzero conservative
+physical-storage target. Optional settings are:
+
+- `path(PathBuf)`: otherwise
+  `<current-executable>.sls-spool.sqlite3` beside the executable;
+- `max_events(u64)`: nonzero pending-row limit;
+- `max_age(Duration)`: nonzero age limit.
+
+The main database is created as `0600` on Unix. Parent-directory protection is
+the application's responsibility. SQLite uses WAL, `synchronous=NORMAL`,
+`auto_vacuum=NONE`, no memory mapping, a 2 MiB cache target, bounded automatic
+checkpointing, and a journal-size target derived from the storage budget.
+
+Retention removes oldest eligible unassigned rows: expired rows first, then
+count pressure, then byte pressure. Assigned rows are never evicted. Payload
+bytes reserve 25% of `max_storage_bytes` for SQLite/WAL overhead. This is a
+conservative target, not an exact filesystem byte cap: page allocation, WAL
+checkpoint timing, filesystem blocks, and non-evictable assigned data affect
+physical `.db`/`.wal`/`.shm` size. An event that cannot fit without evicting an
+assigned batch is rejected.
+
+CPU cost includes serialization, decoding recovered rows, SQLite transactions,
+and normal request encoding/compression. Memory remains bounded by the command
+queue, one decoded upload batch, the SQLite cache, and HTTP/compression
+buffers, but the exact allocator and backend footprint is not a fixed limit.
+Disk write latency is visible to persistent admission.
+
+### Guarantees and non-guarantees
+
+After `try_report` returns `Accepted` in persistent mode, its row's SQLite
+transaction committed. With `synchronous=NORMAL`, this is intended to survive
+ordinary process termination, including forced termination. A reopened
+reporter validates and counts all rows before reporting starts.
+
+A spool is cryptographically-uninteresting but exact-byte bound to its
+endpoint/project/logstore fingerprint; credentials are excluded so key
+rotation does not invalidate recovery. Opening it for another destination
+fails.
+
+Only one assigned batch advances at a time. Assignment, sequence allocation,
+and row marking share one transaction. The spool ID remains stable and
+sequence IDs are monotonic. Retry correctness depends on Aliyun SLS route
+`key`/`seqid` idempotency. If SLS acknowledges but the process stops before
+local acknowledgement, the assigned rows and same sequence remain, so restart
+retries the same request. This is the duplicate/uncertainty window; the
+implementation relies on SLS to recognize that sequence. After local
+acknowledgement commits, those rows are deleted and the next sequence may
+advance.
+
+Unavailable service, retryable 5xx, timeout, attempt exhaustion, failed local
+acknowledgement, shutdown deadline, and restart retain durable rows. Graceful
+shutdown closes admission and tries durable batches until its hard deadline.
+Forced shutdown performs no drain but committed rows remain for reopen.
+Recovered rows bypass fresh-event linger.
+
+There is no guarantee against power loss, OS/kernel crash, disk/controller or
+filesystem failure, faulty write caches, database corruption, manual spool
+modification, or loss of the spool directory. `NORMAL` is not `FULL`.
+
+### New result and statistics surface
+
+With `persist`, `ReportResult` adds `PersistenceFailed`.
+`ReporterStatsSnapshot` adds:
+
+- `persistence_committed`
+- `persistence_failed`
+- `persistence_evicted_count`
+- `persistence_evicted_age`
+- `persistence_evicted_storage`
+- `persistence_evicted_bytes`
+- `persistence_recovered_rows`
+- `persistence_pending_rows`
+- `persistence_pending_bytes`
+- `persistence_replayed`
+- `persistence_failed_cycles`
+
+The generic `dropped` counter also includes retention eviction, while failed
+upload cycles do not count durable rows as dropped. All counters are
+process-local and reset on restart. Pending bytes count serialized event
+payloads, not total SQLite physical allocation.
+
+### Security, tests, and feature isolation
+
+Persisted payloads contain log key/value data and log-group topic, source, and
+tags. They may therefore contain credentials, tokens, personal data, or other
+sensitive fields supplied by the application. Mode `0600` is defense in depth,
+not field-level encryption.
+
+Deterministic coverage includes configuration validation, destination binding,
+schema migration rollback, queue saturation, visible commit, process-kill
+recovery in a subprocess, exact batch reassignment across reopen, remote-ack
+before local-ack uncertainty, local deletion, retry ordering, count/age/byte
+retention, assigned-batch protection, 5xx retention through a fake persistent
+sink, simulated timeout cancellation retention, shutdown retention, stats,
+and Unix permissions. The existing credential-gated live Aliyun test remains
+ignored; live verification that Aliyun deduplicates the exact route
+key/`seqid` contract is still a remaining risk.
+
+The persistent stress example never starts the reporting worker, uses no real
+credentials or network, does not fake delivery, cleans temporary data, and
+reports admission latency/throughput, Linux RSS when available, pending
+rows/bytes, evictions/failures, and combined `.db`/`.wal`/`.shm` size for
+100k/1m runs.
+
+When `persist` is disabled, the module, SQLite dependency, public persistence
+variant/fields, and durable worker are excluded by `cfg`; the memory-only path
+and API behavior remain isolated. The feature adds `rusqlite` and bundled
+`libsqlite3-sys`/SQLite to the resolved graph. `rusqlite` and
+`libsqlite3-sys` are MIT-licensed; SQLite is public domain. The workspace's
+existing `MIT OR Apache-2.0` declaration, authors, repository, and upstream
+attribution are unchanged.
+
+### Remaining persistence risks
+
+- Credential-gated live SLS verification of route-key/`seqid` deduplication is
+  not suitable for offline CI and remains outstanding.
+- `synchronous=NORMAL` trades power-loss durability for admission throughput.
+- SQLite corruption and disk-full behavior are surfaced as admission/upload
+  failures but cannot guarantee recovery of already damaged storage.
+- A permanently assigned batch preserves order but can prevent retention from
+  admitting newer events once no eligible unassigned rows can free space.
+- Physical SQLite size can temporarily exceed the configured conservative
+  target.
+- RSS is only reported portably by the harness on Linux; other platforms print
+  `unavailable`.
+
+### Persistence addendum validation
+
+The following commands were run successfully for this addendum:
+
+```text
+cargo fmt --all
+cargo fmt --all -- --check
+cargo check --workspace
+cargo check -p aliyun-sls --features persist --all-targets
+cargo check --workspace --features persist --all-targets
+cargo test --workspace
+cargo test -p aliyun-sls --features persist
+cargo test --workspace --features persist
+cargo test --workspace --doc
+cargo test -p aliyun-sls --features persist --doc
+cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy -p aliyun-sls --features persist --all-targets -- -D warnings
+cargo clippy --workspace --features persist --all-targets -- -D warnings
+cargo audit
+cargo deny check
+```
+
+Feature-off tests passed with 22 `aliyun-sls` unit tests and 4
+`tracing-aliyun-sls` unit tests; one credential-gated live test was ignored.
+The workspace persist run passed 51 `aliyun-sls` unit tests, 2 persistence
+subprocess integration tests, and 4 `tracing-aliyun-sls` unit tests; the same
+live test was ignored. Workspace documentation tests passed 2 tests; the
+`aliyun-sls` crate currently has no doctests.
+
+Release-mode persistent admission stress runs also completed:
+
+```text
+cargo run -p aliyun-sls --features persist --example persistent_stress --release -- 100000
+cargo run -p aliyun-sls --features persist --example persistent_stress --release -- 1000000
+```
+
+The 100,000-event run accepted every row with zero persistence failures or
+evictions. It completed in 2.865 seconds (34,899 events/second), with 28.6
+microseconds average and 970 microseconds maximum admission latency, 8,000,000
+serialized pending bytes, and 18,001,640 combined SQLite physical bytes.
+
+The 1,000,000-event run also accepted every row with zero persistence failures
+or evictions. It completed in 29.067 seconds (34,404 events/second), with 29.0
+microseconds average and 13.43 milliseconds maximum admission latency,
+80,000,000 serialized pending bytes, and 143,326,952 combined SQLite physical
+bytes. RSS was unavailable on this macOS host. These are local Apple Silicon
+measurements of synchronous durable admission without an upload worker, not a
+service-level performance guarantee.

@@ -4,6 +4,10 @@ Client for [Aliyun SLS](https://help.aliyun.com/zh/sls/) (Aliyun Log Service).
 
 ## Feature Flags
 
+- `reporter`: bounded batching, retry, shutdown, and reporter statistics.
+- `persist`: SQLite-backed reporter admission; implies `reporter`, but also
+  requires runtime opt-in with `ReporterBuilder::build_with_persistence`.
+
 ### Http backend
 
 - [`reqwest`]:
@@ -47,6 +51,79 @@ For log group metadata tags, use:
 - `inline-tags-4`
 - `inline-tags-8` (default)
 - `inline-tags-16`
+
+## Persistent reporter
+
+```toml
+aliyun-sls = { version = "0.1", features = ["persist", "reqwest-rustls"] }
+```
+
+```rust
+use aliyun_sls::reporter::{PersistenceConfig, Reporter};
+use std::{path::PathBuf, time::Duration};
+
+# fn build(client: aliyun_sls::SlsClient) -> Result<Reporter, Box<dyn std::error::Error>> {
+let persistence = PersistenceConfig::new(512 * 1024 * 1024)
+    .path(PathBuf::from("/var/lib/my-service/sls-spool.sqlite3"))
+    .max_events(1_000_000)
+    .max_age(Duration::from_secs(7 * 24 * 60 * 60));
+let reporter = Reporter::builder(client)
+    .build_with_persistence(persistence)?;
+# Ok(reporter)
+# }
+```
+
+The feature and builder call are a double opt-in. `max_storage_bytes` is
+required; `max_events` and `max_age` are optional. If no path is supplied, the
+default is `<current-executable>.sls-spool.sqlite3` beside the executable. The
+database file is mode `0600` on Unix.
+
+The spool uses WAL, `synchronous=NORMAL`, and `auto_vacuum=NONE`. One dedicated
+thread serializes all SQLite writes and one upload lane preserves sequence
+order. Persistent `try_report` never waits for the network or queue capacity,
+but does synchronously wait for the SQLite commit. A full/closed persistence
+command queue, serialization/limit rejection, or SQLite error immediately
+returns `ReportResult::PersistenceFailed`.
+
+Retention evicts the oldest eligible unassigned rows by age, count, then
+storage pressure; assigned rows cannot be evicted. The SQLite physical budget
+is a conservative target, not an exact byte cap: WAL checkpoint timing,
+filesystem allocation, and an assigned batch can make `.db` + `.wal` + `.shm`
+larger. CPU includes serialization and SQLite work. Memory is bounded by the
+command queue, one decoded upload batch, SQLite cache, and request buffers.
+Admission adds synchronous disk I/O and is therefore not the memory-only
+reporter's nonblocking/no-disk-I/O hot path.
+
+A spool is bound to its endpoint/project/logstore. Each assigned batch keeps
+the same spool key and monotonic `seqid`; retry deduplication relies on SLS
+route-key/`seqid` behavior. Unavailable SLS, retry exhaustion, timeout,
+shutdown deadline, and restart retain the batch. If remote acknowledgement
+happens before local SQLite acknowledgement, restart resends the same batch
+and `seqid`; only the local acknowledgement transaction deletes it. Graceful
+shutdown drains until its configured deadline.
+
+`Reporter::stats()` includes committed/failed persistent admissions,
+count/age/storage evictions and evicted bytes, recovered/replayed rows, pending
+rows/serialized bytes, and failed durable upload cycles. Stats are
+process-local. Stored payloads include all log content, topic, source, and
+tags; do not record secrets or sensitive data without treating the spool as
+sensitive storage.
+
+`NORMAL` provides an ordinary process-crash recovery guarantee for committed
+rows, not a guarantee against power loss, OS crash, disk/controller/filesystem
+failure, or faulty write caches.
+
+The network-free stress harness declares the required feature, cleans its
+temporary spool, and reports admission latency/throughput, Linux RSS when
+available, pending rows/bytes, evictions/failures, and combined
+`.db`/`.wal`/`.shm` size:
+
+```text
+cargo run -p aliyun-sls --features persist --example persistent_stress --release -- 100000
+cargo run -p aliyun-sls --features persist --example persistent_stress --release -- 1000000
+```
+
+It does not start reporting or fake a successful delivery.
 
 ## Unstable Features
 
