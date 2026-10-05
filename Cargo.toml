@@ -32,7 +32,6 @@ lz4_flex = { version = "0.11", default-features = false }
 md5 = { version = "0.8", default-features = false }
 miniz_oxide = { version = "0.8", default-features = false }
 nyquest = { version = "0.4" }
-nyquest-interface = { version = "0.4" }
 nyquest-preset = { version = "0.4" }
 reqwest = { version = "0.12", default-features = false }
 rusqlite = { version = "0.40", default-features = false }

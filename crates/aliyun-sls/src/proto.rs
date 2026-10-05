@@ -163,6 +163,7 @@ impl Log {
     }
 
     /// Add a key-value pair to the log contents.
+    #[inline]
     pub fn with(mut self, key: MayStaticKey, value: impl Into<CompactString>) -> Self {
         self.contents.insert(key, value.into());
         self
@@ -479,15 +480,11 @@ impl Message for Log {
 
 // Copy from prost
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 enum WireType {
     Varint = 0,
-    SixtyFourBit = 1,
     LengthDelimited = 2,
-    StartGroup = 3,
-    EndGroup = 4,
     ThirtyTwoBit = 5,
 }
 

@@ -3,7 +3,7 @@
 #![deny(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-/// Formatters for logging [`Event`] to [`aliyun_sls::Log`] event.
+/// Formatters for logging [`tracing::Event`] to an [`aliyun_sls::Log`].
 pub mod event;
 /// Formatters for logging tracing events.
 pub mod format;

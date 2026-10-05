@@ -6,8 +6,8 @@
 //!
 //! - [`reqwest`]:
 //!   `reqwest` feature gate Use [`reqwest`] as the HTTP backend, but do not enable any TLS features.
-//!   - `reqwest-default-tls`: use [`reqwest`] as the HTTP backend and default TLS provider.
-//!   - `reqwest-rustls`: use [`reqwest`] as the HTTP backend and [`rustls`] TLS provider.
+//!   - `reqwest-default-tls`: use [`reqwest`] with [`rustls`] (the default feature alias).
+//!   - `reqwest-rustls`: use [`reqwest`] with [`rustls`] (the explicit alias).
 //!   - or, uou can configure the TLS provider by manually enabling feature gates in [`reqwest`].
 //! - [`nyquest`]: A platform native HTTP client, provides smaller binary size.
 //!
@@ -72,17 +72,43 @@
 #![deny(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-#[cfg(all(all(feature = "lz4", feature = "deflate"), not(docsrs)))]
+#[cfg(all(feature = "lz4", feature = "deflate"))]
 compile_error!("`lz4` and `deflate` cannot be enabled at the same time");
 
+#[cfg(all(feature = "reqwest", feature = "nyquest"))]
+compile_error!("`reqwest` and `nyquest` cannot be enabled at the same time");
+
+#[cfg(not(any(feature = "reqwest", feature = "nyquest")))]
+compile_error!("an HTTP backend must be enabled: choose `reqwest` or `nyquest`");
+
+#[cfg(any(
+    all(feature = "reqwest", not(feature = "nyquest")),
+    all(feature = "nyquest", not(feature = "reqwest"))
+))]
 mod client;
-#[cfg(feature = "persist")]
+#[cfg(all(
+    feature = "persist",
+    any(
+        all(feature = "reqwest", not(feature = "nyquest")),
+        all(feature = "nyquest", not(feature = "reqwest"))
+    )
+))]
 mod persistence;
 mod proto;
-#[cfg(feature = "reporter")]
+#[cfg(all(
+    feature = "reporter",
+    any(
+        all(feature = "reqwest", not(feature = "nyquest")),
+        all(feature = "nyquest", not(feature = "reqwest"))
+    )
+))]
 #[cfg_attr(docsrs, doc(cfg(feature = "reporter")))]
 pub mod reporter;
 
+#[cfg(any(
+    all(feature = "reqwest", not(feature = "nyquest")),
+    all(feature = "nyquest", not(feature = "reqwest"))
+))]
 pub use client::{SlsClient, SlsClientBuilder, SlsClientBuilderError, SlsClientError};
 pub use proto::{Log, LogGroupMetadata, MayStaticKey};
 

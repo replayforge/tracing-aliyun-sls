@@ -93,9 +93,9 @@ impl<S, FT, T, E> Layer<S, FT, T, E> {
     /// Use the given [`timer`] for span and event timestamps.
     ///
     /// See the [`time` module] for the provided timer implementations.
-    //
-    /// [`timer`]: tracing_subscriber::fmt::time::FormatTime
-    /// [`time` module]: mod@tracing_subscriber::fmt::time
+    ///
+    /// [`timer`]: crate::time::RecordTime
+    /// [`time` module]: crate::time
     pub fn with_timer<FT2>(self, timer: FT2) -> Layer<S, FT2, T, E> {
         Layer {
             reporter: self.reporter,

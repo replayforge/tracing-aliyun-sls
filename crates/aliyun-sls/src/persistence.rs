@@ -17,7 +17,9 @@ use std::{
 
 const SCHEMA_VERSION: i64 = 4;
 const CACHE_SIZE_KIB: i64 = 2 * 1024;
-const MAX_WAL_AUTOCHECKPOINT_PAGES: i64 = 1_000;
+const MAX_WAL_AUTOCHECKPOINT_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_GROUP_COMMIT_EVENTS: usize = 32;
+const MAX_GROUP_COMMIT_BYTES: usize = 1024 * 1024;
 const EVICTION_CHUNK_ROWS: i64 = 256;
 
 /// Configuration for the SQLite-backed event spool.
@@ -169,11 +171,13 @@ pub(crate) enum AdmissionFailure {
     Store,
 }
 
+type InsertAcknowledgement = mpsc::SyncSender<Result<(), PersistenceError>>;
+
 enum Command {
     Insert {
         metadata: Arc<LogGroupMetadata>,
         log: Box<Log>,
-        acknowledgement: mpsc::SyncSender<Result<(), PersistenceError>>,
+        acknowledgement: InsertAcknowledgement,
     },
     NextBatch {
         max_count: usize,
@@ -187,6 +191,12 @@ enum Command {
     },
 }
 
+struct PreparedInsert {
+    payload: Vec<u8>,
+    created_at_ms: i64,
+    acknowledgement: InsertAcknowledgement,
+}
+
 pub(crate) struct PersistentBatch {
     pub(crate) sequence_id: u64,
     pub(crate) spool_id: Box<[u8]>,
@@ -198,6 +208,10 @@ pub(crate) struct PersistentBatch {
 struct Store {
     connection: Connection,
     config: PersistenceConfig,
+    #[cfg(test)]
+    committed_transactions: u64,
+    #[cfg(test)]
+    fail_group_commit: bool,
 }
 
 #[derive(Default)]
@@ -362,20 +376,105 @@ fn writer_loop(
     wake_sender: async_channel::Sender<()>,
     state: &State,
 ) {
-    while let Ok(command) = receiver.recv_blocking() {
+    let mut pending = None;
+    loop {
+        let (command, decrement_first_insert) = match pending.take() {
+            Some(command) => (command, false),
+            None => match receiver.recv_blocking() {
+                Ok(command) => (command, true),
+                Err(_) => break,
+            },
+        };
         match command {
             Command::Insert {
                 metadata,
                 log,
                 acknowledgement,
             } => {
-                decrement_queue_depth(state);
-                let result = store.insert(&metadata, &log);
-                if let Ok(outcome) = &result {
-                    update_persistence_stats(state, outcome);
-                    let _ = wake_sender.try_send(());
+                if decrement_first_insert {
+                    decrement_queue_depth(state);
                 }
-                let _ = acknowledgement.send(result.map(|_| ()));
+                let mut commands = Vec::with_capacity(MAX_GROUP_COMMIT_EVENTS);
+                let mut encoded_bytes = 0usize;
+                let mut next = Some((metadata, log, acknowledgement));
+                while let Some((metadata, log, acknowledgement)) = next.take() {
+                    match encode_persisted_event(&metadata, &log) {
+                        Ok(payload)
+                            if payload.len() as u64 <= store.config.payload_budget()
+                                && (commands.is_empty()
+                                    || encoded_bytes.saturating_add(payload.len())
+                                        <= MAX_GROUP_COMMIT_BYTES) =>
+                        {
+                            encoded_bytes = encoded_bytes.saturating_add(payload.len());
+                            commands.push(PreparedInsert {
+                                payload,
+                                created_at_ms: now_millis(),
+                                acknowledgement,
+                            });
+                        }
+                        Ok(payload) if payload.len() as u64 > store.config.payload_budget() => {
+                            let _ = acknowledgement.send(Err(PersistenceError::EventTooLarge));
+                        }
+                        Ok(_) => {
+                            pending = Some(Command::Insert {
+                                metadata,
+                                log,
+                                acknowledgement,
+                            });
+                            break;
+                        }
+                        Err(error) => {
+                            let _ =
+                                acknowledgement.send(Err(PersistenceError::Serialization(error)));
+                        }
+                    }
+                    if commands.len() >= MAX_GROUP_COMMIT_EVENTS {
+                        break;
+                    }
+                    match receiver.try_recv() {
+                        Ok(Command::Insert {
+                            metadata,
+                            log,
+                            acknowledgement,
+                        }) => {
+                            decrement_queue_depth(state);
+                            next = Some((metadata, log, acknowledgement));
+                        }
+                        Ok(command) => {
+                            pending = Some(command);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                if commands.is_empty() {
+                    continue;
+                }
+                match store.insert_group(&commands) {
+                    Ok(results) => {
+                        let mut inserted = false;
+                        for (command, result) in commands.into_iter().zip(results) {
+                            if let Ok(outcome) = &result {
+                                inserted = true;
+                                update_persistence_stats(state, outcome);
+                            }
+                            let _ = command.acknowledgement.send(result.map(|_| ()));
+                        }
+                        if inserted {
+                            let _ = wake_sender.try_send(());
+                        }
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        for command in commands {
+                            let error = PersistenceError::Sqlite(
+                                rusqlite::Error::InvalidParameterName(message.clone()),
+                            );
+                            let _ = command.acknowledgement.send(Err(error));
+                        }
+                    }
+                }
             }
             Command::NextBatch {
                 max_count,
@@ -467,20 +566,22 @@ impl Store {
         connection.pragma_update(None, "mmap_size", 0)?;
         connection.pragma_update(None, "cache_size", -CACHE_SIZE_KIB)?;
         let page_size: i64 = connection.pragma_query_value(None, "page_size", |row| row.get(0))?;
+        let checkpoint_bytes = config
+            .max_storage_bytes
+            .saturating_div(4)
+            .min(MAX_WAL_AUTOCHECKPOINT_BYTES)
+            .max(page_size.max(1) as u64);
         let checkpoint_pages = i64::try_from(
-            config
-                .max_storage_bytes
-                .saturating_div(8)
+            checkpoint_bytes
                 .saturating_div(page_size.max(1) as u64)
                 .max(1),
         )
-        .unwrap_or(MAX_WAL_AUTOCHECKPOINT_PAGES)
-        .min(MAX_WAL_AUTOCHECKPOINT_PAGES);
+        .unwrap_or(i64::MAX);
         connection.pragma_update(None, "wal_autocheckpoint", checkpoint_pages)?;
         connection.pragma_update(
             None,
             "journal_size_limit",
-            i64::try_from((config.max_storage_bytes / 8).max(4096)).unwrap_or(i64::MAX),
+            i64::try_from(checkpoint_bytes).unwrap_or(i64::MAX),
         )?;
 
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -618,9 +719,17 @@ impl Store {
         if stored_fingerprint != destination_fingerprint {
             return Err(PersistenceError::DestinationMismatch);
         }
-        Ok(Self { connection, config })
+        Ok(Self {
+            connection,
+            config,
+            #[cfg(test)]
+            committed_transactions: 0,
+            #[cfg(test)]
+            fail_group_commit: false,
+        })
     }
 
+    #[cfg(test)]
     fn insert(
         &mut self,
         metadata: &LogGroupMetadata,
@@ -629,6 +738,7 @@ impl Store {
         self.insert_at(metadata, log, now_millis())
     }
 
+    #[cfg(test)]
     fn insert_at(
         &mut self,
         metadata: &LogGroupMetadata,
@@ -640,34 +750,84 @@ impl Store {
         if payload.len() as u64 > self.config.payload_budget() {
             return Err(PersistenceError::EventTooLarge);
         }
-        let transaction = self
+        self.insert_group(&[PreparedInsert {
+            payload,
+            created_at_ms,
+            acknowledgement: mpsc::sync_channel(1).0,
+        }])?
+        .pop()
+        .expect("single insert produces one result")
+    }
+
+    fn insert_group(
+        &mut self,
+        commands: &[PreparedInsert],
+    ) -> Result<Vec<Result<InsertOutcome, PersistenceError>>, PersistenceError> {
+        let mut transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut outcomes = Vec::with_capacity(commands.len());
+        for command in commands {
+            let savepoint = transaction.savepoint()?;
+            match Self::insert_encoded(
+                &savepoint,
+                &self.config,
+                &command.payload,
+                command.created_at_ms,
+            ) {
+                Ok(outcome) => {
+                    savepoint.commit()?;
+                    outcomes.push(Ok(outcome));
+                }
+                Err(PersistenceError::EventTooLarge) => {
+                    outcomes.push(Err(PersistenceError::EventTooLarge));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        #[cfg(test)]
+        if self.fail_group_commit {
+            return Err(PersistenceError::Sqlite(rusqlite::Error::InvalidQuery));
+        }
+        transaction.commit()?;
+        #[cfg(test)]
+        {
+            self.committed_transactions = self.committed_transactions.saturating_add(1);
+        }
+        Ok(outcomes)
+    }
+
+    fn insert_encoded(
+        connection: &Connection,
+        config: &PersistenceConfig,
+        payload: &[u8],
+        created_at_ms: i64,
+    ) -> Result<InsertOutcome, PersistenceError> {
         let mut outcome = InsertOutcome::default();
-        let (mut pending_rows, mut pending_bytes) = state_totals(&transaction)?;
-        if let Some(max_age) = self.config.max_age {
+        let (mut pending_rows, mut pending_bytes) = state_totals(connection)?;
+        if let Some(max_age) = config.max_age {
             let age_ms = i64::try_from(max_age.as_millis()).unwrap_or(i64::MAX);
             let cutoff = created_at_ms.saturating_sub(age_ms);
             let (rows, bytes) = totals_where(
-                &transaction,
+                connection,
                 "WHERE batch_seq IS NULL AND created_at_ms < ?1",
                 params![cutoff],
             )?;
-            transaction.execute(
-                "DELETE FROM pending_events
+            connection
+                .prepare_cached(
+                    "DELETE FROM pending_events
                  WHERE batch_seq IS NULL AND created_at_ms < ?1",
-                params![cutoff],
-            )?;
+                )?
+                .execute(params![cutoff])?;
             outcome.evicted_age = rows;
             outcome.evicted_bytes = outcome.evicted_bytes.saturating_add(bytes);
             pending_rows = pending_rows.saturating_sub(rows);
             pending_bytes = pending_bytes.saturating_sub(bytes);
         }
-        if let Some(max_events) = self.config.max_events {
+        if let Some(max_events) = config.max_events {
             let required = pending_rows.saturating_add(1).saturating_sub(max_events);
             if required != 0 {
-                let Some((rows, bytes)) = evict_oldest_unassigned(&transaction, required, 0)?
-                else {
+                let Some((rows, bytes)) = evict_oldest_unassigned(connection, required, 0)? else {
                     return Err(PersistenceError::EventTooLarge);
                 };
                 if rows < required {
@@ -681,9 +841,9 @@ impl Store {
         }
         let required_bytes = pending_bytes
             .saturating_add(payload.len() as u64)
-            .saturating_sub(self.config.payload_budget());
+            .saturating_sub(config.payload_budget());
         if required_bytes != 0 {
-            let Some((rows, bytes)) = evict_oldest_unassigned(&transaction, 0, required_bytes)?
+            let Some((rows, bytes)) = evict_oldest_unassigned(connection, 0, required_bytes)?
             else {
                 return Err(PersistenceError::EventTooLarge);
             };
@@ -695,19 +855,19 @@ impl Store {
             pending_rows = pending_rows.saturating_sub(rows);
             pending_bytes = pending_bytes.saturating_sub(bytes);
         }
-        transaction.execute(
-            "INSERT INTO pending_events(created_at_ms, payload, payload_bytes)
+        connection
+            .prepare_cached(
+                "INSERT INTO pending_events(created_at_ms, payload, payload_bytes)
              VALUES (?1, ?2, ?3)",
-            params![
+            )?
+            .execute(params![
                 created_at_ms,
                 payload,
                 i64::try_from(payload.len()).unwrap_or(i64::MAX)
-            ],
-        )?;
+            ])?;
         outcome.pending_rows = pending_rows.saturating_add(1);
         outcome.pending_bytes = pending_bytes.saturating_add(payload.len() as u64);
-        set_state_totals(&transaction, outcome.pending_rows, outcome.pending_bytes)?;
-        transaction.commit()?;
+        set_state_totals(connection, outcome.pending_rows, outcome.pending_bytes)?;
         Ok(outcome)
     }
 
@@ -837,12 +997,14 @@ impl Store {
                     i64::try_from(persisted_bytes).unwrap_or(i64::MAX)
                 ],
             )?;
-            for id in ids {
-                transaction.execute(
+            {
+                let mut assign = transaction.prepare_cached(
                     "UPDATE pending_events SET batch_seq = ?1
                      WHERE id = ?2 AND batch_seq IS NULL",
-                    params![i64::try_from(sequence_id).unwrap_or(i64::MAX), id],
                 )?;
+                for id in ids {
+                    assign.execute(params![i64::try_from(sequence_id).unwrap_or(i64::MAX), id])?;
+                }
             }
             transaction.execute(
                 "UPDATE spool_state SET next_seq = ?1 WHERE singleton = 1",
@@ -1037,16 +1199,14 @@ fn spool_id(connection: &Connection) -> Result<Box<[u8]>, PersistenceError> {
 }
 
 fn state_totals(connection: &Connection) -> rusqlite::Result<(u64, u64)> {
-    connection.query_row(
-        "SELECT pending_rows, pending_bytes FROM spool_state WHERE singleton = 1",
-        [],
-        |row| {
+    connection
+        .prepare_cached("SELECT pending_rows, pending_bytes FROM spool_state WHERE singleton = 1")?
+        .query_row([], |row| {
             Ok((
                 row.get::<_, i64>(0)?.max(0) as u64,
                 row.get::<_, i64>(1)?.max(0) as u64,
             ))
-        },
-    )
+        })
 }
 
 fn set_state_totals(
@@ -1054,14 +1214,15 @@ fn set_state_totals(
     pending_rows: u64,
     pending_bytes: u64,
 ) -> rusqlite::Result<()> {
-    connection.execute(
-        "UPDATE spool_state SET pending_rows = ?1, pending_bytes = ?2
+    connection
+        .prepare_cached(
+            "UPDATE spool_state SET pending_rows = ?1, pending_bytes = ?2
          WHERE singleton = 1",
-        params![
+        )?
+        .execute(params![
             i64::try_from(pending_rows).unwrap_or(i64::MAX),
             i64::try_from(pending_bytes).unwrap_or(i64::MAX)
-        ],
-    )?;
+        ])?;
     Ok(())
 }
 
@@ -1078,11 +1239,11 @@ fn actual_pending_totals(connection: &Connection) -> rusqlite::Result<(u64, u64)
 }
 
 fn totals_where(
-    transaction: &Transaction<'_>,
+    connection: &Connection,
     suffix: &str,
     parameters: impl rusqlite::Params,
 ) -> rusqlite::Result<(u64, u64)> {
-    transaction.query_row(
+    connection.query_row(
         &format!("SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0) FROM pending_events {suffix}"),
         parameters,
         |row| {
@@ -1094,7 +1255,7 @@ fn totals_where(
 }
 
 fn evict_oldest_unassigned(
-    transaction: &Transaction<'_>,
+    connection: &Connection,
     required_rows: u64,
     required_bytes: u64,
 ) -> rusqlite::Result<Option<(u64, u64)>> {
@@ -1104,7 +1265,7 @@ fn evict_oldest_unassigned(
         if evicted_rows >= required_rows && evicted_bytes >= required_bytes {
             return Ok(Some((evicted_rows, evicted_bytes)));
         }
-        let mut statement = transaction.prepare(
+        let mut statement = connection.prepare_cached(
             "SELECT id, payload_bytes FROM pending_events
              WHERE batch_seq IS NULL ORDER BY id LIMIT ?1",
         )?;
@@ -1127,11 +1288,12 @@ fn evict_oldest_unassigned(
         let Some(last_id) = last_id else {
             return Ok((evicted_rows != 0).then_some((evicted_rows, evicted_bytes)));
         };
-        transaction.execute(
-            "DELETE FROM pending_events
+        connection
+            .prepare_cached(
+                "DELETE FROM pending_events
              WHERE batch_seq IS NULL AND id <= ?1",
-            params![last_id],
-        )?;
+            )?
+            .execute(params![last_id])?;
         evicted_rows = evicted_rows.saturating_add(chunk_rows);
         evicted_bytes = evicted_bytes.saturating_add(chunk_bytes);
     }
@@ -1403,8 +1565,207 @@ mod tests {
         drop(receiver);
     }
 
+    fn queue_insert(
+        sender: &async_channel::Sender<Command>,
+        value: &str,
+    ) -> mpsc::Receiver<Result<(), PersistenceError>> {
+        let (metadata, log) = event(value);
+        let (acknowledgement, result) = mpsc::sync_channel(1);
+        sender
+            .send_blocking(Command::Insert {
+                metadata: Arc::new(metadata),
+                log: Box::new(log),
+                acknowledgement,
+            })
+            .expect("queue insert");
+        result
+    }
+
+    fn run_queued_commands(store: &mut Store, receiver: async_channel::Receiver<Command>) {
+        let (wake_sender, _wake_receiver) = async_channel::bounded(1);
+        writer_loop(store, receiver, wake_sender, &State::default());
+    }
+
     #[test]
-    fn wal_uses_bounded_background_checkpoint_policy() {
+    fn consecutive_inserts_share_commits_and_are_visible_before_ack() {
+        let path = temp_path("group-commit");
+        let mut store = Store::open(
+            PersistenceConfig::new(8 * 1024 * 1024).path(path.clone()),
+            &path,
+        )
+        .expect("open store");
+        let (sender, receiver) = async_channel::bounded(64);
+        let acknowledgements = (0..20)
+            .map(|index| queue_insert(&sender, &format!("event-{index}")))
+            .collect::<Vec<_>>();
+        drop(sender);
+
+        run_queued_commands(&mut store, receiver);
+
+        assert_eq!(store.committed_transactions, 1);
+        let observer = Connection::open(&path).expect("open observer");
+        for (index, acknowledgement) in acknowledgements.into_iter().enumerate() {
+            acknowledgement
+                .recv()
+                .expect("writer response")
+                .expect("committed insert");
+            let visible: i64 = observer
+                .query_row("SELECT COUNT(*) FROM pending_events", [], |row| row.get(0))
+                .expect("count committed rows");
+            assert_eq!(visible, 20, "ack {index} preceded the shared commit");
+        }
+        let _ = fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    #[test]
+    fn too_large_peer_isolated_without_blocking_valid_group() {
+        let path = temp_path("group-invalid-peer");
+        let mut store = Store::open(
+            PersistenceConfig::new(1024 * 1024).path(path.clone()),
+            &path,
+        )
+        .expect("open store");
+        let (sender, receiver) = async_channel::bounded(8);
+        let first = queue_insert(&sender, "first");
+        let oversized = queue_insert(&sender, &"x".repeat(1024 * 1024));
+        let second = queue_insert(&sender, "second");
+        drop(sender);
+
+        run_queued_commands(&mut store, receiver);
+
+        first.recv().expect("first response").expect("first commit");
+        assert!(matches!(
+            oversized.recv().expect("oversized response"),
+            Err(PersistenceError::EventTooLarge)
+        ));
+        second
+            .recv()
+            .expect("second response")
+            .expect("second commit");
+        assert_eq!(store.committed_transactions, 1);
+        assert_eq!(
+            store
+                .load_pending()
+                .expect("load valid peers")
+                .into_iter()
+                .map(|(_, log)| log)
+                .collect::<Vec<_>>(),
+            vec![event("first").1, event("second").1]
+        );
+        let _ = fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    #[test]
+    fn non_insert_command_is_not_overtaken_by_group_drain() {
+        let path = temp_path("group-ordering");
+        let mut store = Store::open(
+            PersistenceConfig::new(1024 * 1024).path(path.clone()),
+            &path,
+        )
+        .expect("open store");
+        let (sender, receiver) = async_channel::bounded(8);
+        let first = queue_insert(&sender, "first");
+        let (batch_sender, batch_result) = async_channel::bounded(1);
+        sender
+            .send_blocking(Command::NextBatch {
+                max_count: 10,
+                max_bytes: usize::MAX,
+                force: true,
+                acknowledgement: batch_sender,
+            })
+            .expect("queue next batch");
+        let second = queue_insert(&sender, "second");
+        drop(sender);
+
+        run_queued_commands(&mut store, receiver);
+
+        first.recv().expect("first response").expect("first commit");
+        let batch = batch_result
+            .recv_blocking()
+            .expect("batch response")
+            .expect("batch query")
+            .expect("assigned batch");
+        assert_eq!(batch.logs, vec![event("first").1]);
+        second
+            .recv()
+            .expect("second response")
+            .expect("second commit");
+        let _ = fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    #[test]
+    fn fatal_group_failure_rolls_back_every_insert_without_acknowledging_success() {
+        let path = temp_path("group-rollback");
+        let mut store = Store::open(
+            PersistenceConfig::new(1024 * 1024).path(path.clone()),
+            &path,
+        )
+        .expect("open store");
+        store.fail_group_commit = true;
+        let (sender, receiver) = async_channel::bounded(8);
+        let first = queue_insert(&sender, "first");
+        let second = queue_insert(&sender, "second");
+        drop(sender);
+
+        run_queued_commands(&mut store, receiver);
+
+        assert!(first.recv().expect("first response").is_err());
+        assert!(second.recv().expect("second response").is_err());
+        assert_eq!(store.committed_transactions, 0);
+        assert_eq!(
+            actual_pending_totals(&store.connection).expect("totals"),
+            (0, 0)
+        );
+        let _ = fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    #[test]
+    fn group_commit_count_and_byte_limits_bound_transactions() {
+        let count_path = temp_path("group-count-bound");
+        let mut count_store = Store::open(
+            PersistenceConfig::new(16 * 1024 * 1024).path(count_path.clone()),
+            &count_path,
+        )
+        .expect("open count store");
+        let (sender, receiver) = async_channel::bounded(64);
+        let acknowledgements = (0..MAX_GROUP_COMMIT_EVENTS + 1)
+            .map(|index| queue_insert(&sender, &format!("event-{index}")))
+            .collect::<Vec<_>>();
+        drop(sender);
+        run_queued_commands(&mut count_store, receiver);
+        assert_eq!(count_store.committed_transactions, 2);
+        assert!(
+            acknowledgements
+                .into_iter()
+                .all(|ack| ack.recv().expect("response").is_ok())
+        );
+
+        let byte_path = temp_path("group-byte-bound");
+        let mut byte_store = Store::open(
+            PersistenceConfig::new(8 * 1024 * 1024).path(byte_path.clone()),
+            &byte_path,
+        )
+        .expect("open byte store");
+        let (sender, receiver) = async_channel::bounded(4);
+        let first = queue_insert(&sender, &"a".repeat(MAX_GROUP_COMMIT_BYTES / 2 + 1));
+        let second = queue_insert(&sender, &"b".repeat(MAX_GROUP_COMMIT_BYTES / 2 + 1));
+        drop(sender);
+        let state = State::default();
+        state.stats.queue_depth.store(2, Ordering::Relaxed);
+        let (wake_sender, _wake_receiver) = async_channel::bounded(1);
+        writer_loop(&mut byte_store, receiver, wake_sender, &state);
+        assert_eq!(byte_store.committed_transactions, 2);
+        assert_eq!(state.stats.queue_depth.load(Ordering::Relaxed), 0);
+        assert!(first.recv().expect("first response").is_ok());
+        assert!(second.recv().expect("second response").is_ok());
+
+        for path in [count_path, byte_path] {
+            let _ = fs::remove_dir_all(path.parent().expect("temporary parent"));
+        }
+    }
+
+    #[test]
+    fn wal_uses_bounded_less_frequent_checkpoint_policy() {
         let path = temp_path("checkpoint-policy");
         let storage_budget = 128 * 1024;
         let store = Store::open(
@@ -1423,11 +1784,11 @@ mod tests {
 
         assert_eq!(
             pages,
-            (storage_budget / 8 / page_size as u64)
+            (storage_budget / 4 / page_size as u64)
                 .max(1)
-                .min(MAX_WAL_AUTOCHECKPOINT_PAGES as u64) as i64
+                .min(MAX_WAL_AUTOCHECKPOINT_BYTES / page_size as u64) as i64
         );
-        assert!(pages.saturating_mul(page_size) <= storage_budget as i64 / 8);
+        assert!(pages.saturating_mul(page_size) <= storage_budget as i64 / 4);
         drop(store);
         let _ = fs::remove_dir_all(path.parent().expect("temporary parent"));
     }

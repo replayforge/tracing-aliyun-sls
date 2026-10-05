@@ -19,7 +19,14 @@ name = "persistent_stress"
 required-features = ["persist"]
 
 [package.metadata.docs.rs]
-all-features = true
+no-default-features = true
+features = [
+  "reqwest-rustls",
+  "lz4",
+  "persist",
+  "inline-keypairs-8",
+  "inline-tags-8",
+]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
@@ -39,9 +46,8 @@ lz4_flex = { workspace = true, optional = true }
 md5.workspace = true
 miniz_oxide = { workspace = true, features = ["with-alloc"], optional = true }
 nyquest = { workspace = true, optional = true }
-nyquest-interface = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
-rusqlite = { workspace = true, features = ["bundled"], optional = true }
+rusqlite = { workspace = true, features = ["bundled", "cache"], optional = true }
 sha1.workspace = true
 smallvec = { workspace = true, features = ["litemap"] }
 thiserror.workspace = true
@@ -82,7 +88,7 @@ reqwest-rustls = [
   "reqwest/rustls-tls",
 ]
 
-nyquest = ["dep:nyquest", "dep:nyquest-interface", "nyquest/async"]
+nyquest = ["dep:nyquest", "nyquest/async"]
 
 inline-none = []
 

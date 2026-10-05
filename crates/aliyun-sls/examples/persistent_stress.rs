@@ -4,8 +4,11 @@
 //!
 //! ```text
 //! cargo run -p aliyun-sls --features persist --example persistent_stress --release -- 100000
+//! cargo run -p aliyun-sls --features persist --example persistent_stress --release -- 100000 536870912 4
 //! cargo run -p aliyun-sls --features persist --example persistent_stress --release -- 1000000
 //! ```
+//!
+//! Arguments are event count, storage bytes, and producer thread count.
 
 use aliyun_sls::{
     Log, LogGroupMetadata, MayStaticKey, SlsClient,
@@ -13,7 +16,7 @@ use aliyun_sls::{
 };
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Barrier},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -37,6 +40,7 @@ impl Drop for TemporarySpool {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_count = argument(1)?.unwrap_or(1_000_000);
     let max_storage_bytes = u64::try_from(argument(2)?.unwrap_or(512 * 1024 * 1024))?;
+    let producer_count = argument(3)?.unwrap_or(1).max(1);
     let directory = temporary_directory();
     std::fs::create_dir_all(&directory)?;
     let cleanup = TemporarySpool(directory.clone());
@@ -56,23 +60,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_with_persistence(PersistenceConfig::new(max_storage_bytes).path(path.clone()))?;
     let metadata = Arc::new(LogGroupMetadata::new().with_topic("persistent-stress"));
 
+    let barrier = Arc::new(Barrier::new(producer_count));
     let started = Instant::now();
+    let mut threads = Vec::with_capacity(producer_count);
+    for producer in 0..producer_count {
+        let reporter = reporter.clone();
+        let metadata = metadata.clone();
+        let barrier = barrier.clone();
+        let start = event_count.saturating_mul(producer) / producer_count;
+        let end = event_count.saturating_mul(producer.saturating_add(1)) / producer_count;
+        threads.push(std::thread::spawn(move || {
+            barrier.wait();
+            let mut admission_nanos = 0u128;
+            let mut max_admission = Duration::ZERO;
+            let mut unexpected = None;
+            for index in start..end {
+                let log = Log::new(u32::try_from(index).unwrap_or(u32::MAX), None).with(
+                    MayStaticKey::from_static("message"),
+                    "persistent stress event",
+                );
+                let admission_started = Instant::now();
+                let result = reporter.try_report(metadata.clone(), log);
+                let latency = admission_started.elapsed();
+                admission_nanos = admission_nanos.saturating_add(latency.as_nanos());
+                max_admission = max_admission.max(latency);
+                if !matches!(
+                    result,
+                    ReportResult::Accepted | ReportResult::PersistenceFailed
+                ) {
+                    unexpected = Some(result);
+                    break;
+                }
+            }
+            (admission_nanos, max_admission, unexpected)
+        }));
+    }
     let mut admission_nanos = 0u128;
     let mut max_admission = Duration::ZERO;
-    for index in 0..event_count {
-        let log = Log::new(u32::try_from(index).unwrap_or(u32::MAX), None).with(
-            MayStaticKey::from_static("message"),
-            "persistent stress event",
-        );
-        let admission_started = Instant::now();
-        let result = reporter.try_report(metadata.clone(), log);
-        let latency = admission_started.elapsed();
-        admission_nanos = admission_nanos.saturating_add(latency.as_nanos());
-        max_admission = max_admission.max(latency);
-        if !matches!(
-            result,
-            ReportResult::Accepted | ReportResult::PersistenceFailed
-        ) {
+    for thread in threads {
+        let (thread_nanos, thread_max, unexpected) =
+            thread.join().map_err(|_| "producer thread panicked")?;
+        admission_nanos = admission_nanos.saturating_add(thread_nanos);
+        max_admission = max_admission.max(thread_max);
+        if let Some(result) = unexpected {
             return Err(format!("unexpected persistent admission result: {result:?}").into());
         }
     }
@@ -85,7 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "unavailable".to_owned());
 
     println!(
-        "events={event_count} accepted={} persistence_failures={} \
+        "events={event_count} producers={producer_count} accepted={} persistence_failures={} \
          evicted_count={} evicted_age={} evicted_storage={} evicted_bytes={} \
          pending_rows={} pending_bytes={} sqlite_physical_bytes={physical_bytes} \
          elapsed={elapsed:?} events_per_second={:.0} \

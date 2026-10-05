@@ -59,8 +59,8 @@ impl<T> Format<T> {
     ///
     /// See [`time` module] for the provided timer implementations.
     ///
-    /// [`timer`]: tracing_subscriber::fmt::time::FormatTime
-    /// [`time` module]: mod@tracing_subscriber::fmt::time
+    /// [`timer`]: crate::time::RecordTime
+    /// [`time` module]: crate::time
     pub fn with_timer<T2>(self, timer: T2) -> Format<T2> {
         Format {
             timer,

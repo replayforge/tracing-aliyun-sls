@@ -12,16 +12,20 @@ rust-version.workspace = true
 version = "0.3.0"
 
 [package.metadata.docs.rs]
-all-features = true
+no-default-features = true
+features = [
+  "reqwest-rustls",
+  "lz4",
+  "persist",
+  "aliyun-sls/inline-keypairs-8",
+  "aliyun-sls/inline-tags-8",
+]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 aliyun-sls = { path = "../aliyun-sls", default-features = false, features = ["reporter"] }
-async-channel = { workspace = true, features = ["std"] }
 bitflags.workspace = true
 compact_str.workspace = true
-futures-util = { workspace = true, default-features = false, features = ["async-await-macro", "std"] }
-thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["std"] }
 
