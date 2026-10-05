@@ -1,9 +1,7 @@
 use crate::client::headers;
-use async_lock::OnceCell;
 use http::HeaderMap;
 use reqwest::header::{HeaderName, HeaderValue};
-
-static HTTP_CLIENT: OnceCell<HttpClient> = OnceCell::new();
+use std::time::Duration;
 
 #[derive(Clone)]
 pub(crate) struct HttpClient {
@@ -27,11 +25,13 @@ pub type Error = reqwest::Error;
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl HttpClient {
-    async fn new() -> Result<Self> {
+    pub(crate) async fn new(connect_timeout: Duration, request_timeout: Duration) -> Result<Self> {
         Ok(Self {
             inner: reqwest::ClientBuilder::new()
                 .user_agent(headers::USER_AGENT_VALUE)
                 .https_only(true)
+                .connect_timeout(connect_timeout)
+                .timeout(request_timeout)
                 .default_headers(HeaderMap::from_iter([
                     (
                         HeaderName::from_static(headers::CONTENT_TYPE),
@@ -48,10 +48,6 @@ impl HttpClient {
                 ]))
                 .build()?,
         })
-    }
-
-    pub async fn get_or_try_init() -> Result<&'static Self> {
-        HTTP_CLIENT.get_or_try_init(HttpClient::new).await
     }
 
     pub fn post(&self, url: &str) -> RequestBuilder {
@@ -97,4 +93,12 @@ impl From<StatusCode> for u16 {
     fn from(status: StatusCode) -> u16 {
         status.inner.as_u16()
     }
+}
+
+pub(crate) fn is_retryable_error(error: &Error) -> bool {
+    error.is_connect() || error.is_timeout()
+}
+
+pub(crate) fn status_code_from_error(_error: &Error) -> Option<u16> {
+    None
 }

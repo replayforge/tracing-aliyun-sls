@@ -1,7 +1,11 @@
 use crate::client::{SlsClient, SlsClientInner, signer};
+use async_lock::OnceCell;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
+
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Builder error.
 #[derive(Debug, thiserror::Error)]
@@ -23,6 +27,8 @@ pub struct SlsClientBuilder<'a> {
     project: Option<&'a str>,
     logstore: Option<&'a str>,
     shard_key: Option<&'a str>,
+    connect_timeout: Duration,
+    request_timeout: Duration,
     enable_trace: bool,
     print_internal_error: bool,
     #[cfg(feature = "deflate")]
@@ -40,6 +46,8 @@ impl Default for SlsClientBuilder<'_> {
             project: None,
             logstore: None,
             shard_key: None,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
             enable_trace: true,
             print_internal_error: false,
             #[cfg(feature = "deflate")]
@@ -85,6 +93,25 @@ impl<'a> SlsClientBuilder<'a> {
     /// Set the shard key for the SLS client.
     pub fn shard_key(mut self, shard_key: &'a str) -> Self {
         self.shard_key = Some(shard_key);
+        self
+    }
+
+    /// Set the timeout for establishing an HTTP connection.
+    ///
+    /// The default is 3 seconds.
+    ///
+    /// Nyquest 0.4 does not expose a separate connect timeout, so this setting
+    /// applies to the reqwest backend.
+    pub fn connect_timeout(mut self, connect_timeout: Duration) -> Self {
+        self.connect_timeout = connect_timeout;
+        self
+    }
+
+    /// Set the timeout for completing an HTTP request.
+    ///
+    /// The default is 10 seconds.
+    pub fn request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = request_timeout;
         self
     }
 
@@ -146,6 +173,9 @@ impl<'a> SlsClientBuilder<'a> {
                 access_key,
                 canonicalized_resource,
             },
+            http_client: OnceCell::new(),
+            connect_timeout: self.connect_timeout,
+            request_timeout: self.request_timeout,
             enable_trace: self.enable_trace,
             print_internal_error: self.print_internal_error,
             #[cfg(feature = "deflate")]
@@ -155,5 +185,42 @@ impl<'a> SlsClientBuilder<'a> {
         Ok(SlsClient {
             inner: Arc::new(client),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_client(builder: SlsClientBuilder<'_>) -> SlsClient {
+        builder
+            .access_key("key")
+            .access_secret("secret")
+            .expect("test secret is valid")
+            .endpoint("example.com")
+            .project("project")
+            .logstore("logstore")
+            .build()
+            .expect("test configuration is complete")
+    }
+
+    #[test]
+    fn timeout_defaults_are_applied() {
+        let client = build_client(SlsClientBuilder::default());
+
+        assert_eq!(client.inner.connect_timeout, Duration::from_secs(3));
+        assert_eq!(client.inner.request_timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn timeouts_are_configurable() {
+        let client = build_client(
+            SlsClientBuilder::default()
+                .connect_timeout(Duration::from_secs(1))
+                .request_timeout(Duration::from_secs(7)),
+        );
+
+        assert_eq!(client.inner.connect_timeout, Duration::from_secs(1));
+        assert_eq!(client.inner.request_timeout, Duration::from_secs(7));
     }
 }

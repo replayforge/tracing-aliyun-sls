@@ -1,8 +1,5 @@
 use crate::client::headers;
-use async_lock::OnceCell;
-use std::borrow::Cow;
-
-static HTTP_CLIENT: OnceCell<HttpClient> = OnceCell::new();
+use std::{borrow::Cow, time::Duration};
 
 #[derive(Clone)]
 pub(crate) struct HttpClient {
@@ -27,20 +24,17 @@ pub type Error = nyquest::Error;
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl HttpClient {
-    async fn new() -> Result<Self> {
+    pub(crate) async fn new(_connect_timeout: Duration, request_timeout: Duration) -> Result<Self> {
         Ok(Self {
             inner: nyquest::ClientBuilder::default()
                 .user_agent(headers::USER_AGENT_VALUE)
+                .request_timeout(request_timeout)
                 // .with_header(headers::CONTENT_TYPE, headers::DEFAULT_CONTENT_TYPE)
                 .with_header(headers::LOG_API_VERSION, headers::API_VERSION)
                 .with_header(headers::LOG_SIGNATURE_METHOD, headers::SIGNATURE_METHOD)
                 .build_async()
                 .await?,
         })
-    }
-
-    pub async fn get_or_try_init() -> Result<&'static Self> {
-        HTTP_CLIENT.get_or_try_init(HttpClient::new).await
     }
 
     pub fn post(&self, url: &str) -> RequestBuilder {
@@ -87,5 +81,19 @@ impl StatusCode {
 impl From<StatusCode> for u16 {
     fn from(status: StatusCode) -> u16 {
         status.inner.code()
+    }
+}
+
+pub(crate) fn is_retryable_error(error: &Error) -> bool {
+    matches!(
+        error,
+        nyquest::Error::Io(_) | nyquest::Error::RequestTimeout
+    )
+}
+
+pub(crate) fn status_code_from_error(error: &Error) -> Option<u16> {
+    match error {
+        nyquest::Error::NonSuccessfulStatusCode(status) => Some(status.code()),
+        _ => None,
     }
 }
