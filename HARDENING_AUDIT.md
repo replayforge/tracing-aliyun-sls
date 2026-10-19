@@ -694,3 +694,112 @@ throughput from 19.24 million to 20.44 million attempts/second (about 6%).
 Inlining the much larger `Reporter::try_report` together with it reduced median
 throughput to 16.88 million attempts/second, so that hint was rejected.
 No `#[inline(always)]` annotations were added.
+
+## Per-event upload flag and sent-row retention addendum (2026-10-19)
+
+This addendum is the current state for `persist` builds and supersedes the
+persistence addendum where it says that acknowledged rows are deleted, that
+every spool row is queued for upload, or that retention only evicts unassigned
+rows.
+
+### Why
+
+The spool now doubles as the application's local log history: every event is
+stored, the application decides per event whether it is uploaded, and uploaded
+rows stay on disk after SLS accepts them. Retention by age, count, and storage
+is the only thing that removes rows. Previously every row was queued for
+upload, acknowledgement deleted rows, and retention could only remove
+unassigned (that is, not yet sent) rows.
+
+### What changed
+
+- Schema v5 adds `pending_events.upload` (default `1`) and
+  `pending_events.sent` (default `0`). Every v4 row was queued and
+  unacknowledged, so the defaults describe existing rows exactly; an assigned
+  v4 batch keeps its sequence ID and spool key. `pending_events_batch` becomes
+  a partial index over assigned/sent rows, and the new partial index
+  `pending_events_unsent` covers unassigned upload rows, so batch selection
+  does not scan sent or local-only rows. The upgrade runs in the same
+  `IMMEDIATE` transaction as the `user_version` bump; a failed or interrupted
+  upgrade leaves a v4 file that a later open upgrades again.
+- `Reporter::try_report_with_upload` / `report_with_upload` take the upload
+  flag. `try_report` / `report` are unchanged and mark rows for upload.
+  `ReportResult::NotStored` reports a local-only event given to a reporter
+  without a persistent spool (it is discarded, never uploaded).
+- `tracing_aliyun_sls::Layer::with_upload_decision` installs a
+  `Fn(&Event, &mut Log) -> bool` callback. The crate re-exports `Log` and
+  `MayStaticKey` so callers can add fields.
+- Batch selection takes only `upload = 1` rows that are unassigned (and
+  therefore unsent). Acknowledgement runs `UPDATE ... SET sent = 1` and deletes
+  the `assigned_batches` row in one transaction; it no longer deletes events.
+- Retention evicts any row except the assigned, unacknowledged batch:
+  `batch_seq IS NULL OR sent = 1`. Startup limit enforcement uses the same
+  predicate.
+- `persistence_abandoned` counts evicted rows with `upload = 1 AND sent = 0`.
+  `dropped` now grows only by abandoned rows; evicting sent or local-only rows
+  is ordinary retention and is visible only in `persistence_evicted_*` and
+  `persistence_evicted_bytes`. `persistence_pending_rows` / `_bytes` now count
+  every stored row. `persistence_recovered_rows` counts unsent upload rows
+  found at open; only those rows are decoded at startup and marked recovered.
+- The uploader is woken only when a committed group contains an upload row.
+
+### Invariants that changed
+
+- **Admission (`on_event`)**: unchanged for builds without `persist` and for
+  layers without an upload decision. With a decision installed, the callback
+  is application code on the `on_event` path. The library imposes the same
+  rule on it as on itself: no HTTP, sleep, retry, blocking channel send, or
+  re-entrant `tracing`. Persistent admission still synchronously waits for the
+  SQLite commit, as documented in the persistence addendum; a local-only row
+  costs the same commit.
+- **Acknowledged rows** are retained instead of deleted. Their removal is now
+  a retention decision, and a full spool of sent rows is evicted oldest-first
+  rather than blocking admission.
+- **Retention scope** widened from unassigned rows to all rows except the
+  assigned batch. The assigned-batch protection is unchanged.
+- **`dropped`** no longer includes retention of rows that were already sent or
+  never meant to be sent.
+
+### Guarantees
+
+- A row marked local-only is never assigned to a batch and never uploaded.
+- A row whose acknowledgement committed is never sent again, including after a
+  restart.
+- The duplicate window is unchanged: from SLS accepting a batch to the local
+  acknowledgement commit. A process killed inside it reopens the same assigned
+  batch and resends it with the same spool key and `seqid`. The loss window is
+  unchanged: from `on_event` entry to the writer's commit.
+- Per-event write cost did not grow: measured WAL frames per committed upload
+  row 4.44 before / 4.43 after; a local-only row writes 3.37 because it is not
+  in either partial index. Assign plus acknowledge of a 100-row batch wrote
+  36.6 frames before (DELETE) and 34.4 after (UPDATE). Method:
+  `wal_frames_per_event` ignored test, release build, 400-byte payload,
+  `wal_autocheckpoint=0`, 2,000 preloaded rows, one transaction per event.
+
+### Not guaranteed
+
+- Correctness of the per-event decision is the application's responsibility,
+  including how it behaves under contention; a slow or blocking callback
+  delays the emitting thread.
+- A local-only event is discarded when the reporter has no persistent spool.
+- Synthesized span lifecycle events have no `Event` and are always marked for
+  upload.
+- Retention can remove unsent upload rows (abandoned uploads, counted) exactly
+  as before; the guarantees and non-guarantees of the persistence addendum
+  about power loss, OS crash, and live SLS `seqid` deduplication still apply.
+
+### Validation
+
+Deterministic tests cover: v4 to v5 upgrade with an assigned batch keeping its
+`seqid`; an interrupted upgrade rolling back to v4 and succeeding on retry;
+local-only rows never batched; sent rows retained and not resent after reopen;
+age, count, storage, and startup retention removing sent, local-only, and
+unsent rows with only the unsent ones counted as abandoned; the assigned batch
+surviving retention; per-row flags through `try_report_with_upload`;
+`NotStored` without a spool; the Layer callback; and two subprocess `kill -9`
+tests (killed after commit before send, killed after a fake SLS accepted the
+batch but before local acknowledgement) that reopen the spool and check that a
+recording fake sink receives the row with the expected `seqid` and spool key.
+Mutations reverting acknowledgement to `DELETE`, dropping the `upload = 1`
+batch filter, or restricting retention to unassigned rows each fail several of
+these tests.

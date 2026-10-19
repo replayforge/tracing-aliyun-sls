@@ -143,8 +143,22 @@ rejection, and SQLite errors immediately return
 `ReportResult::PersistenceFailed`. This changes the memory-only
 nonblocking/no-disk-I/O admission invariant.
 
-Retention removes the oldest eligible unassigned rows. Assigned batches are
-not evicted. The byte limit reserves conservative headroom for database
+The spool is also the local log history. Every row carries an `upload` flag,
+decided per event by the caller, and a `sent` marker:
+
+- `upload = 1` rows are batched and sent to SLS. After SLS acknowledges a
+  batch, its rows are marked `sent = 1` and **kept**; they are never sent
+  again, including after a restart.
+- `upload = 0` (local-only) rows are committed like any other row but never
+  uploaded.
+
+Retention (age, row count, storage) applies to **all** rows: sent, local-only,
+and rows still waiting for upload. It removes the oldest rows first and never
+removes the batch currently assigned for upload. Because sent rows are
+evictable, a spool filled with history does not block new rows. Removing a row
+that was marked for upload but not yet sent abandons that upload; it is counted
+in `persistence_abandoned` and `dropped`. Removing sent or local-only rows is
+ordinary retention and only appears in the `persistence_evicted_*` counters. The byte limit reserves conservative headroom for database
 metadata and WAL growth, so `max_storage_bytes` is a physical-budget target,
 not an exact byte cap. CPU work includes event serialization and SQLite;
 memory is bounded by the command queue, one decoded upload batch, SQLite's
@@ -159,13 +173,43 @@ batch keeps a stable spool key and monotonic `seqid`; retries rely on SLS route
 deadline, or process restart leaves the assigned batch durable and retries it
 before newer rows. If SLS acknowledged a request but the process stopped
 before the local SQLite acknowledgement, the same batch and `seqid` are sent
-again. After local acknowledgement the rows are deleted. Graceful shutdown
-tries to drain until its deadline; forced termination relies on reopening the
-spool.
+again. After local acknowledgement the rows are marked sent and stay until
+retention removes them. Graceful shutdown tries to drain until its deadline;
+forced termination relies on reopening the spool.
+
+### Per-event upload decision
+
+Without a decision every event is marked for upload, which is the same
+behavior as before the `upload` flag existed. With `persist`, the Layer accepts
+a callback that decides per event:
+
+```rust
+# fn build(reporter: tracing_aliyun_sls::reporter::Reporter) {
+use tracing_aliyun_sls::MayStaticKey;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+let layer = tracing_aliyun_sls::layer(reporter).with_upload_decision(|event, log| {
+    log.insert(MayStaticKey::from_static("decided_by"), "app");
+    // Upload WARN and ERROR; keep everything else as local history only.
+    *event.metadata().level() <= tracing::Level::WARN
+});
+tracing_subscriber::registry().with(layer).init();
+# }
+```
+
+The callback runs inside `on_event`, on the thread that emitted the event,
+after the event is formatted and before the row is committed. It may add fields
+to `log`. It must not perform network I/O, sleep, block, emit `tracing` events,
+or panic. Synthesized span lifecycle events have no `Event` and are always
+marked for upload. The reporter-level equivalents are
+`Reporter::try_report_with_upload` and `Reporter::report_with_upload`. A
+local-only event given to a reporter without a persistent spool is discarded
+and `try_report_with_upload` returns `ReportResult::NotStored`.
 
 `Reporter::stats()` exposes persistent committed/failed admission, current
-pending rows/serialized bytes, count/age/storage evictions and evicted bytes,
-recovered/replayed rows, and failed durable upload cycles. Counters reset on
+stored rows/serialized bytes (including sent and local-only rows),
+count/age/storage evictions and evicted bytes, abandoned uploads, recovered
+unsent rows, replayed rows, and failed durable upload cycles. Counters reset on
 restart. Stored payloads include log contents plus topic, source, and tags, so
 the spool may contain credentials, tokens, personal data, or other sensitive
 fields recorded by the application.

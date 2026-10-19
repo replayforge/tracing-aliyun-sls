@@ -24,6 +24,10 @@ use tracing_subscriber::{
 
 const INTERNAL_TARGET: &str = "tracing_aliyun_sls_internal";
 
+/// Per-event upload decision installed with [`Layer::with_upload_decision`].
+#[cfg(feature = "persist")]
+type UploadDecision = Arc<dyn Fn(&Event<'_>, &mut Log) -> bool + Send + Sync>;
+
 /// A [`Layer`] that logs to a [`Reporter`].
 ///
 /// [`Layer`]: tracing_subscriber::layer::Layer
@@ -35,6 +39,8 @@ pub struct Layer<S, FT = SystemTime, T = tags::DefaultTags, E = event::DefaultEv
     record_span: format::RecordSpanConfig,
     instance_id: Option<CompactString>,
     log_internal_errors: bool,
+    #[cfg(feature = "persist")]
+    upload_decision: Option<UploadDecision>,
     _inner: PhantomData<fn(S)>,
 }
 
@@ -49,6 +55,8 @@ impl<S> Layer<S> {
             record_span: format::RecordSpanConfig::default(),
             log_internal_errors: true,
             instance_id: None,
+            #[cfg(feature = "persist")]
+            upload_decision: None,
             _inner: PhantomData,
         }
     }
@@ -68,6 +76,8 @@ impl<S, FT, T, E> Layer<S, FT, T, E> {
             record_span: self.record_span,
             instance_id: self.instance_id,
             log_internal_errors: self.log_internal_errors,
+            #[cfg(feature = "persist")]
+            upload_decision: self.upload_decision,
             _inner: PhantomData,
         }
     }
@@ -86,6 +96,8 @@ impl<S, FT, T, E> Layer<S, FT, T, E> {
             record_span: self.record_span,
             instance_id: self.instance_id,
             log_internal_errors: self.log_internal_errors,
+            #[cfg(feature = "persist")]
+            upload_decision: self.upload_decision,
             _inner: PhantomData,
         }
     }
@@ -105,6 +117,8 @@ impl<S, FT, T, E> Layer<S, FT, T, E> {
             record_span: self.record_span.with_time(),
             instance_id: self.instance_id,
             log_internal_errors: self.log_internal_errors,
+            #[cfg(feature = "persist")]
+            upload_decision: self.upload_decision,
             _inner: self._inner,
         }
     }
@@ -119,6 +133,8 @@ impl<S, FT, T, E> Layer<S, FT, T, E> {
             record_span: self.record_span.without_time(),
             instance_id: self.instance_id,
             log_internal_errors: self.log_internal_errors,
+            #[cfg(feature = "persist")]
+            upload_decision: self.upload_decision,
             _inner: self._inner,
         }
     }
@@ -237,6 +253,36 @@ impl<S, FT, T, E> Layer<S, FT, T, E> {
             ..self
         }
     }
+
+    /// Decide per event whether it is uploaded or kept as local history only.
+    ///
+    /// `decide` runs inside [`tracing_subscriber::Layer::on_event`] after the
+    /// event has been formatted into `log`, and before the log is admitted.
+    /// Returning `true` admits it for upload (the behavior without a decision);
+    /// returning `false` stores it in the persistent spool as a local-only row
+    /// that is never uploaded. `decide` may add fields to `log`, for example a
+    /// count of earlier events it chose not to upload.
+    ///
+    /// Without a persistent spool (a reporter not built with
+    /// `build_with_persistence`) a local-only log is discarded.
+    ///
+    /// `decide` runs on the thread that emitted the event, so it inherits the
+    /// `on_event` constraints: it must not perform network I/O, sleep, block
+    /// on a channel or lock held across I/O, emit `tracing` events (they would
+    /// re-enter subscribers), or panic. Synthesized span lifecycle events
+    /// (see [`Layer::with_span_events`]) have no [`Event`] and are always
+    /// admitted for upload.
+    #[cfg(feature = "persist")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "persist")))]
+    pub fn with_upload_decision<F>(self, decide: F) -> Self
+    where
+        F: Fn(&Event<'_>, &mut Log) -> bool + Send + Sync + 'static,
+    {
+        Self {
+            upload_decision: Some(Arc::new(decide)),
+            ..self
+        }
+    }
 }
 
 impl<S, FT, T, E> layer::Layer<S> for Layer<S, FT, T, E>
@@ -328,6 +374,12 @@ where
         self.record_event
             .record_event(event, &ctx, &self.format, &mut log);
 
+        #[cfg(feature = "persist")]
+        if let Some(decide) = &self.upload_decision {
+            let upload = decide(event, &mut log);
+            self.reporter.report_with_upload(metadata, log, upload);
+            return;
+        }
         self.reporter.report(metadata, log);
     }
 
@@ -531,6 +583,51 @@ mod tests {
 
         assert_eq!(busy, "1.00µs");
         assert_eq!(idle, "2.00µs");
+    }
+
+    #[cfg(feature = "persist")]
+    #[test]
+    fn upload_decision_sees_each_event_and_routes_local_only() {
+        use std::sync::Mutex;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let client = aliyun_sls::SlsClient::builder()
+            .access_key("key")
+            .access_secret("secret")
+            .expect("valid test secret")
+            .endpoint("example.com")
+            .project("project")
+            .logstore("logstore")
+            .enable_trace(false)
+            .build()
+            .expect("complete test client");
+        // A memory-only reporter has no spool: local-only events are not
+        // admitted, so `accepted` counts exactly the events decided `true`.
+        let reporter = Reporter::builder(client).build();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let layer = layer(reporter.clone()).with_upload_decision(move |event, log| {
+            log.insert(MayStaticKey::from_static("decided"), "yes");
+            recorded
+                .lock()
+                .expect("record decision")
+                .push(*event.metadata().level());
+            *event.metadata().level() <= tracing::Level::WARN
+        });
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("local only");
+            tracing::warn!("uploaded");
+            tracing::error!(target: INTERNAL_TARGET, "excluded before the decision");
+        });
+
+        assert_eq!(
+            *seen.lock().expect("decisions"),
+            vec![tracing::Level::INFO, tracing::Level::WARN]
+        );
+        let stats = reporter.stats();
+        assert_eq!((stats.received, stats.accepted), (2, 1));
     }
 
     #[test]

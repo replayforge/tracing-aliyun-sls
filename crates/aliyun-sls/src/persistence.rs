@@ -15,7 +15,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const CACHE_SIZE_KIB: i64 = 2 * 1024;
 const MAX_WAL_AUTOCHECKPOINT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_GROUP_COMMIT_EVENTS: usize = 32;
@@ -95,20 +95,22 @@ impl PersistenceConfig {
         self
     }
 
-    /// Limit the number of pending events retained in the spool.
+    /// Limit the number of rows retained in the spool.
     ///
-    /// When admitting a new event, the oldest eligible unassigned rows are
-    /// evicted first. An assigned upload batch is never evicted.
+    /// The limit counts every stored row: rows waiting for upload, rows already
+    /// sent, and local-only rows. When admitting a new event, the oldest rows
+    /// that are not part of the assigned upload batch are evicted first. An
+    /// assigned upload batch is never evicted.
     pub fn max_events(mut self, max_events: u64) -> Self {
         self.max_events = Some(max_events);
         self
     }
 
-    /// Limit how long pending events are retained in the spool.
+    /// Limit how long rows are retained in the spool.
     ///
-    /// Expired unassigned rows are removed during admission and startup limit
-    /// enforcement. An assigned upload batch remains until local
-    /// acknowledgement.
+    /// Expired rows (sent, local-only, or still waiting for upload) are removed
+    /// during admission and startup limit enforcement. An assigned upload batch
+    /// remains until local acknowledgement.
     pub fn max_age(mut self, max_age: Duration) -> Self {
         self.max_age = Some(max_age);
         self
@@ -177,6 +179,7 @@ enum Command {
     Insert {
         metadata: Arc<LogGroupMetadata>,
         log: Box<Log>,
+        upload: bool,
         acknowledgement: InsertAcknowledgement,
     },
     NextBatch {
@@ -194,6 +197,7 @@ enum Command {
 struct PreparedInsert {
     payload: Vec<u8>,
     created_at_ms: i64,
+    upload: bool,
     acknowledgement: InsertAcknowledgement,
 }
 
@@ -220,6 +224,9 @@ pub(crate) struct InsertOutcome {
     pub(crate) evicted_count: u64,
     pub(crate) evicted_storage: u64,
     pub(crate) evicted_bytes: u64,
+    /// Subset of the evicted rows that were marked for upload but not yet
+    /// sent; their upload is abandoned.
+    pub(crate) abandoned: u64,
     pub(crate) pending_rows: u64,
     pub(crate) pending_bytes: u64,
 }
@@ -260,11 +267,11 @@ impl PersistenceSender {
                                     store.recover_pending()
                                 });
                         match pending {
-                            Ok((rows, bytes)) => {
+                            Ok((recovered, rows, bytes)) => {
                                 state
                                     .stats
                                     .persistence_recovered_rows
-                                    .fetch_add(rows, Ordering::Relaxed);
+                                    .fetch_add(recovered, Ordering::Relaxed);
                                 state
                                     .stats
                                     .persistence_pending_rows
@@ -301,6 +308,7 @@ impl PersistenceSender {
         &self,
         metadata: Arc<LogGroupMetadata>,
         log: Log,
+        upload: bool,
         state: &State,
     ) -> Result<(), AdmissionFailure> {
         let (acknowledgement, result) = mpsc::sync_channel(1);
@@ -308,6 +316,7 @@ impl PersistenceSender {
         match self.sender.try_send(Command::Insert {
             metadata,
             log: Box::new(log),
+            upload,
             acknowledgement,
         }) {
             Ok(()) => result
@@ -389,6 +398,7 @@ fn writer_loop(
             Command::Insert {
                 metadata,
                 log,
+                upload,
                 acknowledgement,
             } => {
                 if decrement_first_insert {
@@ -396,8 +406,8 @@ fn writer_loop(
                 }
                 let mut commands = Vec::with_capacity(MAX_GROUP_COMMIT_EVENTS);
                 let mut encoded_bytes = 0usize;
-                let mut next = Some((metadata, log, acknowledgement));
-                while let Some((metadata, log, acknowledgement)) = next.take() {
+                let mut next = Some((metadata, log, upload, acknowledgement));
+                while let Some((metadata, log, upload, acknowledgement)) = next.take() {
                     match encode_persisted_event(&metadata, &log) {
                         Ok(payload)
                             if payload.len() as u64 <= store.config.payload_budget()
@@ -409,6 +419,7 @@ fn writer_loop(
                             commands.push(PreparedInsert {
                                 payload,
                                 created_at_ms: now_millis(),
+                                upload,
                                 acknowledgement,
                             });
                         }
@@ -419,6 +430,7 @@ fn writer_loop(
                             pending = Some(Command::Insert {
                                 metadata,
                                 log,
+                                upload,
                                 acknowledgement,
                             });
                             break;
@@ -435,10 +447,11 @@ fn writer_loop(
                         Ok(Command::Insert {
                             metadata,
                             log,
+                            upload,
                             acknowledgement,
                         }) => {
                             decrement_queue_depth(state);
-                            next = Some((metadata, log, acknowledgement));
+                            next = Some((metadata, log, upload, acknowledgement));
                         }
                         Ok(command) => {
                             pending = Some(command);
@@ -453,15 +466,17 @@ fn writer_loop(
                 }
                 match store.insert_group(&commands) {
                     Ok(results) => {
-                        let mut inserted = false;
+                        // Only rows marked for upload can form a batch, so a
+                        // group of local-only rows does not wake the uploader.
+                        let mut uploadable = false;
                         for (command, result) in commands.into_iter().zip(results) {
                             if let Ok(outcome) = &result {
-                                inserted = true;
+                                uploadable |= command.upload;
                                 update_persistence_stats(state, outcome);
                             }
                             let _ = command.acknowledgement.send(result.map(|_| ()));
                         }
-                        if inserted {
+                        if uploadable {
                             let _ = wake_sender.try_send(());
                         }
                     }
@@ -518,20 +533,22 @@ fn update_persistence_stats(state: &State, outcome: &InsertOutcome) {
         .fetch_add(outcome.evicted_bytes, Ordering::Relaxed);
     state
         .stats
+        .persistence_abandoned
+        .fetch_add(outcome.abandoned, Ordering::Relaxed);
+    state
+        .stats
         .persistence_pending_rows
         .store(outcome.pending_rows, Ordering::Relaxed);
     state
         .stats
         .persistence_pending_bytes
         .store(outcome.pending_bytes, Ordering::Relaxed);
-    let evicted_rows = outcome
-        .evicted_age
-        .saturating_add(outcome.evicted_count)
-        .saturating_add(outcome.evicted_storage);
+    // Removing a sent or local-only row is ordinary retention; only rows whose
+    // upload is abandoned are lost telemetry.
     state
         .stats
         .dropped
-        .fetch_add(evicted_rows, Ordering::Relaxed);
+        .fetch_add(outcome.abandoned, Ordering::Relaxed);
 }
 
 fn decrement_queue_depth(state: &State) {
@@ -706,8 +723,25 @@ impl Store {
                         [],
                     )?;
                 }
+                4 => {}
                 _ => unreachable!("schema version checked above"),
             }
+            // v4 -> v5: per-row upload flag and sent marker. Every v4 row was
+            // queued for upload and had not been acknowledged (acknowledged
+            // rows were deleted), so the defaults describe existing rows
+            // exactly. The batch index only needs assigned/sent rows, and a
+            // partial index keeps upload selection independent of the number
+            // of sent and local-only rows. Runs in the same transaction as the
+            // version bump, so an interrupted upgrade leaves a v4 file.
+            transaction.execute_batch(
+                "ALTER TABLE pending_events ADD COLUMN upload INTEGER NOT NULL DEFAULT 1;
+                 ALTER TABLE pending_events ADD COLUMN sent INTEGER NOT NULL DEFAULT 0;
+                 DROP INDEX IF EXISTS pending_events_batch;
+                 CREATE INDEX pending_events_batch
+                    ON pending_events(batch_seq, id) WHERE batch_seq IS NOT NULL;
+                 CREATE INDEX pending_events_unsent
+                    ON pending_events(id) WHERE batch_seq IS NULL AND upload = 1;",
+            )?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -735,7 +769,7 @@ impl Store {
         metadata: &LogGroupMetadata,
         log: &Log,
     ) -> Result<InsertOutcome, PersistenceError> {
-        self.insert_at(metadata, log, now_millis())
+        self.insert_at(metadata, log, now_millis(), true)
     }
 
     #[cfg(test)]
@@ -744,6 +778,7 @@ impl Store {
         metadata: &LogGroupMetadata,
         log: &Log,
         created_at_ms: i64,
+        upload: bool,
     ) -> Result<InsertOutcome, PersistenceError> {
         let payload =
             encode_persisted_event(metadata, log).map_err(PersistenceError::Serialization)?;
@@ -753,6 +788,7 @@ impl Store {
         self.insert_group(&[PreparedInsert {
             payload,
             created_at_ms,
+            upload,
             acknowledgement: mpsc::sync_channel(1).0,
         }])?
         .pop()
@@ -774,6 +810,7 @@ impl Store {
                 &self.config,
                 &command.payload,
                 command.created_at_ms,
+                command.upload,
             ) {
                 Ok(outcome) => {
                     savepoint.commit()?;
@@ -802,32 +839,24 @@ impl Store {
         config: &PersistenceConfig,
         payload: &[u8],
         created_at_ms: i64,
+        upload: bool,
     ) -> Result<InsertOutcome, PersistenceError> {
         let mut outcome = InsertOutcome::default();
         let (mut pending_rows, mut pending_bytes) = state_totals(connection)?;
         if let Some(max_age) = config.max_age {
             let age_ms = i64::try_from(max_age.as_millis()).unwrap_or(i64::MAX);
-            let cutoff = created_at_ms.saturating_sub(age_ms);
-            let (rows, bytes) = totals_where(
-                connection,
-                "WHERE batch_seq IS NULL AND created_at_ms < ?1",
-                params![cutoff],
-            )?;
-            connection
-                .prepare_cached(
-                    "DELETE FROM pending_events
-                 WHERE batch_seq IS NULL AND created_at_ms < ?1",
-                )?
-                .execute(params![cutoff])?;
+            let (rows, bytes, abandoned) =
+                evict_expired(connection, created_at_ms.saturating_sub(age_ms))?;
             outcome.evicted_age = rows;
             outcome.evicted_bytes = outcome.evicted_bytes.saturating_add(bytes);
+            outcome.abandoned = outcome.abandoned.saturating_add(abandoned);
             pending_rows = pending_rows.saturating_sub(rows);
             pending_bytes = pending_bytes.saturating_sub(bytes);
         }
         if let Some(max_events) = config.max_events {
             let required = pending_rows.saturating_add(1).saturating_sub(max_events);
             if required != 0 {
-                let Some((rows, bytes)) = evict_oldest_unassigned(connection, required, 0)? else {
+                let Some((rows, bytes, abandoned)) = evict_oldest(connection, required, 0)? else {
                     return Err(PersistenceError::EventTooLarge);
                 };
                 if rows < required {
@@ -835,6 +864,7 @@ impl Store {
                 }
                 outcome.evicted_count = outcome.evicted_count.saturating_add(rows);
                 outcome.evicted_bytes = outcome.evicted_bytes.saturating_add(bytes);
+                outcome.abandoned = outcome.abandoned.saturating_add(abandoned);
                 pending_rows = pending_rows.saturating_sub(rows);
                 pending_bytes = pending_bytes.saturating_sub(bytes);
             }
@@ -843,7 +873,7 @@ impl Store {
             .saturating_add(payload.len() as u64)
             .saturating_sub(config.payload_budget());
         if required_bytes != 0 {
-            let Some((rows, bytes)) = evict_oldest_unassigned(connection, 0, required_bytes)?
+            let Some((rows, bytes, abandoned)) = evict_oldest(connection, 0, required_bytes)?
             else {
                 return Err(PersistenceError::EventTooLarge);
             };
@@ -852,18 +882,20 @@ impl Store {
             }
             outcome.evicted_storage = outcome.evicted_storage.saturating_add(rows);
             outcome.evicted_bytes = outcome.evicted_bytes.saturating_add(bytes);
+            outcome.abandoned = outcome.abandoned.saturating_add(abandoned);
             pending_rows = pending_rows.saturating_sub(rows);
             pending_bytes = pending_bytes.saturating_sub(bytes);
         }
         connection
             .prepare_cached(
-                "INSERT INTO pending_events(created_at_ms, payload, payload_bytes)
-             VALUES (?1, ?2, ?3)",
+                "INSERT INTO pending_events(created_at_ms, payload, payload_bytes, upload)
+             VALUES (?1, ?2, ?3, ?4)",
             )?
             .execute(params![
                 created_at_ms,
                 payload,
-                i64::try_from(payload.len()).unwrap_or(i64::MAX)
+                i64::try_from(payload.len()).unwrap_or(i64::MAX),
+                upload
             ])?;
         outcome.pending_rows = pending_rows.saturating_add(1);
         outcome.pending_bytes = pending_bytes.saturating_add(payload.len() as u64);
@@ -882,28 +914,21 @@ impl Store {
         let (mut pending_rows, mut pending_bytes) = state_totals(&transaction)?;
         if let Some(max_age) = self.config.max_age {
             let age_ms = i64::try_from(max_age.as_millis()).unwrap_or(i64::MAX);
-            let cutoff = current_time_ms.saturating_sub(age_ms);
-            let (rows, bytes) = totals_where(
-                &transaction,
-                "WHERE batch_seq IS NULL AND created_at_ms < ?1",
-                params![cutoff],
-            )?;
-            transaction.execute(
-                "DELETE FROM pending_events
-                 WHERE batch_seq IS NULL AND created_at_ms < ?1",
-                params![cutoff],
-            )?;
+            let (rows, bytes, abandoned) =
+                evict_expired(&transaction, current_time_ms.saturating_sub(age_ms))?;
             outcome.evicted_age = rows;
             outcome.evicted_bytes = bytes;
+            outcome.abandoned = abandoned;
             pending_rows = pending_rows.saturating_sub(rows);
             pending_bytes = pending_bytes.saturating_sub(bytes);
         }
         if let Some(max_events) = self.config.max_events {
             let required = pending_rows.saturating_sub(max_events);
             if required != 0 {
-                if let Some((rows, bytes)) = evict_oldest_unassigned(&transaction, required, 0)? {
+                if let Some((rows, bytes, abandoned)) = evict_oldest(&transaction, required, 0)? {
                     outcome.evicted_count = outcome.evicted_count.saturating_add(rows);
                     outcome.evicted_bytes = outcome.evicted_bytes.saturating_add(bytes);
+                    outcome.abandoned = outcome.abandoned.saturating_add(abandoned);
                     pending_rows = pending_rows.saturating_sub(rows);
                     pending_bytes = pending_bytes.saturating_sub(bytes);
                 }
@@ -911,9 +936,10 @@ impl Store {
         }
         let required_bytes = pending_bytes.saturating_sub(self.config.payload_budget());
         if required_bytes != 0 {
-            if let Some((rows, bytes)) = evict_oldest_unassigned(&transaction, 0, required_bytes)? {
+            if let Some((rows, bytes, abandoned)) = evict_oldest(&transaction, 0, required_bytes)? {
                 outcome.evicted_storage = outcome.evicted_storage.saturating_add(rows);
                 outcome.evicted_bytes = outcome.evicted_bytes.saturating_add(bytes);
+                outcome.abandoned = outcome.abandoned.saturating_add(abandoned);
                 pending_rows = pending_rows.saturating_sub(rows);
                 pending_bytes = pending_bytes.saturating_sub(bytes);
             }
@@ -930,10 +956,15 @@ impl Store {
         state_totals(&self.connection).map_err(PersistenceError::Sqlite)
     }
 
-    fn recover_pending(&mut self) -> Result<(u64, u64), PersistenceError> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT payload FROM pending_events ORDER BY id")?;
+    /// Validate rows that still have to be uploaded and mark them recovered.
+    ///
+    /// Returns the number of recovered upload rows and the stored row/byte
+    /// totals. Sent and local-only rows are not decoded: they never reach the
+    /// uploader, so validating them would only lengthen startup.
+    fn recover_pending(&mut self) -> Result<(u64, u64, u64), PersistenceError> {
+        let mut statement = self.connection.prepare(
+            "SELECT payload FROM pending_events WHERE upload = 1 AND sent = 0 ORDER BY id",
+        )?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             let payload = row.get::<_, Vec<u8>>(0)?;
@@ -946,9 +977,11 @@ impl Store {
         if actual != stored {
             return Err(PersistenceError::InconsistentState);
         }
-        self.connection
-            .execute("UPDATE pending_events SET recovered = 1", [])?;
-        Ok(stored)
+        let recovered = self.connection.execute(
+            "UPDATE pending_events SET recovered = 1 WHERE upload = 1 AND sent = 0",
+            [],
+        )?;
+        Ok((recovered as u64, stored.0, stored.1))
     }
 
     fn next_batch(
@@ -1032,43 +1065,45 @@ impl Store {
         }))
     }
 
+    /// Record that SLS accepted the assigned batch.
+    ///
+    /// The rows stay in the spool marked `sent = 1` (local history); retention
+    /// removes them later. Stored totals are unchanged because no row leaves
+    /// the table. Removing the `assigned_batches` row in the same transaction
+    /// lets the next sequence advance; until this commits, a restart reloads
+    /// and resends the same batch with the same sequence ID.
     fn acknowledge(&mut self, sequence_id: u64) -> Result<InsertOutcome, PersistenceError> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let sequence_id = i64::try_from(sequence_id).unwrap_or(i64::MAX);
-        let acknowledged = transaction
-            .query_row(
-                "SELECT event_count, payload_bytes FROM assigned_batches
-                 WHERE sequence_id = ?1",
-                params![sequence_id],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?.max(0) as u64,
-                        row.get::<_, i64>(1)?.max(0) as u64,
-                    ))
-                },
-            )
-            .optional()?
-            .unwrap_or_default();
         transaction.execute(
-            "DELETE FROM pending_events WHERE batch_seq = ?1",
+            "UPDATE pending_events SET sent = 1 WHERE batch_seq = ?1",
             params![sequence_id],
         )?;
         transaction.execute(
             "DELETE FROM assigned_batches WHERE sequence_id = ?1",
             params![sequence_id],
         )?;
-        let totals = state_totals(&transaction)?;
-        let pending_rows = totals.0.saturating_sub(acknowledged.0);
-        let pending_bytes = totals.1.saturating_sub(acknowledged.1);
-        set_state_totals(&transaction, pending_rows, pending_bytes)?;
+        let (pending_rows, pending_bytes) = state_totals(&transaction)?;
         transaction.commit()?;
         Ok(InsertOutcome {
             pending_rows,
             pending_bytes,
             ..InsertOutcome::default()
         })
+    }
+
+    /// `(upload, sent)` for every stored row in insertion order.
+    #[cfg(test)]
+    fn row_flags(&self) -> Result<Vec<(bool, bool)>, PersistenceError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT upload, sent FROM pending_events ORDER BY id")?;
+        let flags = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(flags)
     }
 
     #[cfg(test)]
@@ -1095,7 +1130,7 @@ fn select_unassigned_batch(
 ) -> Result<Option<DecodedBatch>, PersistenceError> {
     let mut statement = transaction.prepare(
         "SELECT id, payload, recovered, payload_bytes FROM pending_events
-         WHERE batch_seq IS NULL ORDER BY id LIMIT ?1",
+         WHERE batch_seq IS NULL AND upload = 1 ORDER BY id LIMIT ?1",
     )?;
     let query_limit = max_count.saturating_add(1);
     let mut rows = statement.query(params![i64::try_from(query_limit).unwrap_or(i64::MAX)])?;
@@ -1238,45 +1273,76 @@ fn actual_pending_totals(connection: &Connection) -> rusqlite::Result<(u64, u64)
     )
 }
 
-fn totals_where(
-    connection: &Connection,
-    suffix: &str,
-    parameters: impl rusqlite::Params,
-) -> rusqlite::Result<(u64, u64)> {
-    connection.query_row(
-        &format!("SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0) FROM pending_events {suffix}"),
-        parameters,
-        |row| {
-            let rows = row.get::<_, i64>(0)?;
-            let bytes = row.get::<_, i64>(1)?;
-            Ok((rows.max(0) as u64, bytes.max(0) as u64))
-        },
-    )
+/// Rows that retention may remove: everything except the assigned, not yet
+/// acknowledged upload batch. Sent rows keep their `batch_seq`, so `sent = 1`
+/// distinguishes them from the assigned batch.
+macro_rules! evictable {
+    () => {
+        "(batch_seq IS NULL OR sent = 1)"
+    };
 }
 
-fn evict_oldest_unassigned(
+/// Delete evictable rows created before `cutoff`.
+///
+/// Returns removed rows, removed payload bytes, and how many of them were
+/// marked for upload but not yet sent (abandoned uploads).
+fn evict_expired(connection: &Connection, cutoff: i64) -> rusqlite::Result<(u64, u64, u64)> {
+    let totals = connection
+        .prepare_cached(concat!(
+            "SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0),
+                    COALESCE(SUM(upload = 1 AND sent = 0), 0)
+             FROM pending_events WHERE ",
+            evictable!(),
+            " AND created_at_ms < ?1"
+        ))?
+        .query_row(params![cutoff], |row| {
+            Ok((
+                row.get::<_, i64>(0)?.max(0) as u64,
+                row.get::<_, i64>(1)?.max(0) as u64,
+                row.get::<_, i64>(2)?.max(0) as u64,
+            ))
+        })?;
+    connection
+        .prepare_cached(concat!(
+            "DELETE FROM pending_events WHERE ",
+            evictable!(),
+            " AND created_at_ms < ?1"
+        ))?
+        .execute(params![cutoff])?;
+    Ok(totals)
+}
+
+/// Delete the oldest evictable rows until both requirements are met.
+///
+/// Returns removed rows, removed payload bytes, and abandoned uploads, or
+/// `None` when nothing could be removed.
+fn evict_oldest(
     connection: &Connection,
     required_rows: u64,
     required_bytes: u64,
-) -> rusqlite::Result<Option<(u64, u64)>> {
+) -> rusqlite::Result<Option<(u64, u64, u64)>> {
     let mut evicted_rows = 0u64;
     let mut evicted_bytes = 0u64;
+    let mut abandoned = 0u64;
     loop {
         if evicted_rows >= required_rows && evicted_bytes >= required_bytes {
-            return Ok(Some((evicted_rows, evicted_bytes)));
+            return Ok(Some((evicted_rows, evicted_bytes, abandoned)));
         }
-        let mut statement = connection.prepare_cached(
-            "SELECT id, payload_bytes FROM pending_events
-             WHERE batch_seq IS NULL ORDER BY id LIMIT ?1",
-        )?;
+        let mut statement = connection.prepare_cached(concat!(
+            "SELECT id, payload_bytes, upload = 1 AND sent = 0 FROM pending_events WHERE ",
+            evictable!(),
+            " ORDER BY id LIMIT ?1"
+        ))?;
         let mut rows = statement.query(params![EVICTION_CHUNK_ROWS])?;
         let mut chunk_rows = 0u64;
         let mut chunk_bytes = 0u64;
+        let mut chunk_abandoned = 0u64;
         let mut last_id = None;
         while let Some(row) = rows.next()? {
             last_id = Some(row.get::<_, i64>(0)?);
             chunk_rows = chunk_rows.saturating_add(1);
             chunk_bytes = chunk_bytes.saturating_add(row.get::<_, i64>(1)?.max(0) as u64);
+            chunk_abandoned = chunk_abandoned.saturating_add(u64::from(row.get::<_, bool>(2)?));
             if evicted_rows.saturating_add(chunk_rows) >= required_rows
                 && evicted_bytes.saturating_add(chunk_bytes) >= required_bytes
             {
@@ -1286,16 +1352,18 @@ fn evict_oldest_unassigned(
         drop(rows);
         drop(statement);
         let Some(last_id) = last_id else {
-            return Ok((evicted_rows != 0).then_some((evicted_rows, evicted_bytes)));
+            return Ok((evicted_rows != 0).then_some((evicted_rows, evicted_bytes, abandoned)));
         };
         connection
-            .prepare_cached(
-                "DELETE FROM pending_events
-             WHERE batch_seq IS NULL AND id <= ?1",
-            )?
+            .prepare_cached(concat!(
+                "DELETE FROM pending_events WHERE ",
+                evictable!(),
+                " AND id <= ?1"
+            ))?
             .execute(params![last_id])?;
         evicted_rows = evicted_rows.saturating_add(chunk_rows);
         evicted_bytes = evicted_bytes.saturating_add(chunk_bytes);
+        abandoned = abandoned.saturating_add(chunk_abandoned);
     }
 }
 
@@ -1552,6 +1620,7 @@ mod tests {
             .try_send(Command::Insert {
                 metadata: Arc::new(metadata),
                 log: Box::new(log),
+                upload: true,
                 acknowledgement,
             })
             .expect("first command fills queue");
@@ -1559,7 +1628,7 @@ mod tests {
         let (metadata, log) = event("rejected");
 
         assert!(matches!(
-            persistence.commit(Arc::new(metadata), log, &state),
+            persistence.commit(Arc::new(metadata), log, true, &state),
             Err(AdmissionFailure::Full)
         ));
         drop(receiver);
@@ -1575,6 +1644,7 @@ mod tests {
             .send_blocking(Command::Insert {
                 metadata: Arc::new(metadata),
                 log: Box::new(log),
+                upload: true,
                 acknowledgement,
             })
             .expect("queue insert");
@@ -1857,7 +1927,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_ack_crash_window_retries_same_batch_until_local_ack_deletes_it() {
+    fn remote_ack_crash_window_retries_same_batch_until_local_ack_marks_it_sent() {
         let path = temp_path("remote-before-local-ack");
         let config = PersistenceConfig::new(1024 * 1024).path(path.clone());
         let expected = event("uncertain-remote-ack");
@@ -1890,14 +1960,20 @@ mod tests {
         drop(reopened);
 
         let mut after_ack = Store::open(config, &path).expect("reopen after local ack");
-        after_ack.recover_pending().expect("recover empty spool");
+        assert_eq!(
+            after_ack.recover_pending().expect("recover sent spool").0,
+            0,
+            "a sent row is not recovered for upload"
+        );
         assert!(
             after_ack
                 .next_batch(1, usize::MAX, true)
-                .expect("check empty spool")
+                .expect("check nothing left to send")
                 .is_none()
         );
-        assert_eq!(after_ack.pending_totals().expect("empty totals"), (0, 0));
+        assert_eq!(after_ack.row_flags().expect("flags"), vec![(true, true)]);
+        assert_eq!(after_ack.pending_totals().expect("retained totals").0, 1);
+        assert_totals_consistent(&after_ack);
         let _ = fs::remove_dir_all(path.parent().expect("temporary parent"));
     }
 
@@ -1966,7 +2042,7 @@ mod tests {
     }
 
     #[test]
-    fn acknowledgement_deletes_only_its_assigned_batch() {
+    fn acknowledgement_marks_only_its_assigned_batch_sent() {
         let path = temp_path("exact-ack");
         let mut store = Store::open(
             PersistenceConfig::new(1024 * 1024).path(path.clone()),
@@ -1984,8 +2060,15 @@ mod tests {
 
         let outcome = store.acknowledge(batch.sequence_id).expect("ack batch");
 
-        assert_eq!(outcome.pending_rows, 1);
-        assert_eq!(store.load_pending().expect("remaining"), vec![second]);
+        assert_eq!(outcome.pending_rows, 2, "acknowledged rows stay stored");
+        assert_eq!(
+            store.load_pending().expect("remaining"),
+            vec![first, second]
+        );
+        assert_eq!(
+            store.row_flags().expect("flags"),
+            vec![(true, true), (true, false)]
+        );
         assert_totals_consistent(&store);
         let _ = fs::remove_dir_all(path.parent().expect("temporary parent"));
     }
@@ -2085,11 +2168,11 @@ mod tests {
         .expect("open age store");
         let old = event("old");
         age_store
-            .insert_at(&old.0, &old.1, 1)
+            .insert_at(&old.0, &old.1, 1, true)
             .expect("insert old event");
         let fresh = event("fresh");
         let age_outcome = age_store
-            .insert_at(&fresh.0, &fresh.1, 2_001)
+            .insert_at(&fresh.0, &fresh.1, 2_001, true)
             .expect("insert fresh event");
         assert_eq!(age_outcome.evicted_age, 1);
         assert_eq!(age_outcome.evicted_storage, 0);
@@ -2125,7 +2208,7 @@ mod tests {
     }
 
     #[test]
-    fn retention_counters_increment_dropped_rows() {
+    fn retention_counters_drop_only_abandoned_rows() {
         let state = State::default();
         update_persistence_stats(
             &state,
@@ -2134,6 +2217,7 @@ mod tests {
                 evicted_count: 3,
                 evicted_storage: 4,
                 evicted_bytes: 512,
+                abandoned: 6,
                 pending_rows: 5,
                 pending_bytes: 1_024,
             },
@@ -2157,11 +2241,429 @@ mod tests {
                 .load(Ordering::Relaxed),
             4
         );
-        assert_eq!(state.stats.dropped.load(Ordering::Relaxed), 9);
+        assert_eq!(state.stats.persistence_abandoned.load(Ordering::Relaxed), 6);
+        assert_eq!(state.stats.dropped.load(Ordering::Relaxed), 6);
         assert_eq!(
             state.stats.persistence_pending_rows.load(Ordering::Relaxed),
             5
         );
+    }
+
+    /// Create a spool exactly as schema v4 did, with one assigned row
+    /// (`sequence_id = 3`) and one unassigned row.
+    fn create_v4_spool(path: &Path) {
+        fs::create_dir_all(path.parent().expect("temporary parent")).expect("create parent");
+        let connection = Connection::open(path).expect("create v4 database");
+        let (metadata, log) = event("v4");
+        let payload = encode_persisted_event(&metadata, &log).expect("encode v4 row");
+        connection
+            .execute_batch(
+                "CREATE TABLE pending_events (
+                    id INTEGER PRIMARY KEY,
+                    created_at_ms INTEGER NOT NULL,
+                    payload BLOB NOT NULL,
+                    payload_bytes INTEGER NOT NULL,
+                    batch_seq INTEGER,
+                    recovered INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX pending_events_created ON pending_events(created_at_ms, id);
+                CREATE INDEX pending_events_batch ON pending_events(batch_seq, id);
+                CREATE TABLE spool_state (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    spool_id BLOB NOT NULL,
+                    next_seq INTEGER NOT NULL,
+                    destination_fingerprint BLOB NOT NULL,
+                    pending_rows INTEGER NOT NULL,
+                    pending_bytes INTEGER NOT NULL
+                );
+                CREATE TABLE assigned_batches (
+                    sequence_id INTEGER PRIMARY KEY,
+                    assigned_at_ms INTEGER NOT NULL,
+                    event_count INTEGER NOT NULL,
+                    payload_bytes INTEGER NOT NULL
+                );",
+            )
+            .expect("create v4 schema");
+        let bytes = payload.len() as i64;
+        connection
+            .execute(
+                "INSERT INTO pending_events(created_at_ms, payload, payload_bytes, batch_seq)
+                 VALUES (1, ?1, ?2, 3), (2, ?1, ?2, NULL)",
+                params![payload, bytes],
+            )
+            .expect("insert v4 rows");
+        connection
+            .execute(
+                "INSERT INTO spool_state VALUES (1, x'0102', 4, ?1, 2, ?2)",
+                params![b"test-destination".as_slice(), bytes * 2],
+            )
+            .expect("insert v4 state");
+        connection
+            .execute(
+                "INSERT INTO assigned_batches VALUES (3, 1, 1, ?1)",
+                params![bytes],
+            )
+            .expect("insert v4 batch");
+        connection
+            .pragma_update(None, "user_version", 4)
+            .expect("set v4 version");
+    }
+
+    fn user_version(connection: &Connection) -> i64 {
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read version")
+    }
+
+    #[test]
+    fn v4_spool_upgrades_to_v5_keeping_rows_queued_and_batch_assigned() {
+        let path = temp_path("migration-v4");
+        create_v4_spool(&path);
+        let config = PersistenceConfig::new(1024 * 1024).path(path.clone());
+
+        let mut store = Store::open(config, &path).expect("upgrade v4 spool");
+
+        assert_eq!(user_version(&store.connection), 5);
+        assert_eq!(
+            store.row_flags().expect("flags"),
+            vec![(true, false), (true, false)],
+            "every v4 row was waiting for upload"
+        );
+        assert_totals_consistent(&store);
+        assert_eq!(store.recover_pending().expect("recover").0, 2);
+        let assigned = store
+            .next_batch(10, usize::MAX, true)
+            .expect("load assigned")
+            .expect("assigned v4 batch");
+        assert_eq!(assigned.sequence_id, 3, "same seqid as before the upgrade");
+        assert_eq!(&*assigned.spool_id, &[1, 2]);
+        assert_eq!(assigned.logs.len(), 1);
+        store.acknowledge(3).expect("ack v4 batch");
+        let next = store
+            .next_batch(10, usize::MAX, true)
+            .expect("assign remaining")
+            .expect("remaining v4 row");
+        assert_eq!(next.sequence_id, 4);
+        let _ = fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    #[test]
+    fn interrupted_v5_upgrade_rolls_back_to_v4_and_can_be_retried() {
+        let path = temp_path("migration-v4-interrupted");
+        create_v4_spool(&path);
+        // An object with the name of the new index makes the upgrade fail
+        // after both ALTER TABLE statements ran inside the transaction.
+        Connection::open(&path)
+            .expect("open v4")
+            .execute_batch("CREATE TABLE pending_events_unsent(x)")
+            .expect("create conflicting object");
+        let config = PersistenceConfig::new(1024 * 1024).path(path.clone());
+
+        assert!(matches!(
+            Store::open(config.clone(), &path),
+            Err(PersistenceError::Sqlite(_))
+        ));
+        let connection = Connection::open(&path).expect("reopen failed upgrade");
+        assert_eq!(user_version(&connection), 4);
+        let new_columns: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('pending_events')
+                 WHERE name IN ('upload', 'sent')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect columns");
+        assert_eq!(new_columns, 0, "partial upgrade was rolled back");
+        connection
+            .execute_batch("DROP TABLE pending_events_unsent")
+            .expect("remove conflict");
+        drop(connection);
+
+        let store = Store::open(config, &path).expect("retry upgrade");
+        assert_eq!(user_version(&store.connection), 5);
+        assert_eq!(store.row_flags().expect("flags").len(), 2);
+        assert_totals_consistent(&store);
+        let _ = fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    #[test]
+    fn local_only_rows_are_never_batched_and_sent_rows_are_not_resent() {
+        let path = temp_path("local-only");
+        let config = PersistenceConfig::new(1024 * 1024).path(path.clone());
+        let local = event("local");
+        let upload = event("upload");
+        {
+            let mut store = Store::open(config.clone(), &path).expect("open store");
+            store
+                .insert_at(&local.0, &local.1, now_millis(), false)
+                .expect("insert local-only");
+            store.insert(&upload.0, &upload.1).expect("insert upload");
+            store
+                .insert_at(&local.0, &local.1, now_millis(), false)
+                .expect("insert local-only");
+            let batch = store
+                .next_batch(10, usize::MAX, true)
+                .expect("assign")
+                .expect("upload batch");
+            assert_eq!(batch.logs, vec![upload.1.clone()]);
+            store.acknowledge(batch.sequence_id).expect("ack");
+            assert!(
+                store
+                    .next_batch(10, usize::MAX, true)
+                    .expect("nothing else")
+                    .is_none(),
+                "local-only rows are never assigned"
+            );
+            assert_eq!(
+                store.row_flags().expect("flags"),
+                vec![(false, false), (true, true), (false, false)]
+            );
+        }
+        let mut reopened = Store::open(config, &path).expect("reopen");
+        assert_eq!(reopened.recover_pending().expect("recover").0, 0);
+        assert!(
+            reopened
+                .next_batch(10, usize::MAX, false)
+                .expect("check after restart")
+                .is_none(),
+            "a sent row is not resent after restart"
+        );
+        assert_eq!(reopened.pending_totals().expect("totals").0, 3);
+        let _ = fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    /// Insert, oldest first: one sent row, one local-only row, and one row
+    /// still waiting for upload.
+    fn insert_sent_local_unsent(store: &mut Store, value: &str, created_at_ms: i64) {
+        let item = event(value);
+        store
+            .insert_at(&item.0, &item.1, created_at_ms, true)
+            .expect("insert to-be-sent row");
+        let batch = store
+            .next_batch(1, usize::MAX, true)
+            .expect("assign")
+            .expect("batch");
+        store.acknowledge(batch.sequence_id).expect("ack");
+        store
+            .insert_at(&item.0, &item.1, created_at_ms, false)
+            .expect("insert local-only row");
+        store
+            .insert_at(&item.0, &item.1, created_at_ms, true)
+            .expect("insert unsent row");
+        assert_eq!(
+            store.row_flags().expect("flags"),
+            vec![(true, true), (false, false), (true, false)]
+        );
+    }
+
+    #[test]
+    fn age_retention_removes_sent_local_and_unsent_rows_counting_only_abandoned() {
+        let path = temp_path("age-all-rows");
+        let mut store = Store::open(
+            PersistenceConfig::new(1024 * 1024)
+                .path(path.clone())
+                .max_age(Duration::from_secs(1)),
+            &path,
+        )
+        .expect("open store");
+        insert_sent_local_unsent(&mut store, "old", 1);
+        let fresh = event("fresh");
+
+        let outcome = store
+            .insert_at(&fresh.0, &fresh.1, 2_001, false)
+            .expect("insert fresh");
+
+        assert_eq!(outcome.evicted_age, 3);
+        assert_eq!(outcome.abandoned, 1);
+        assert_eq!(store.row_flags().expect("flags"), vec![(false, false)]);
+        assert_totals_consistent(&store);
+        let _ = fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    #[test]
+    fn count_retention_removes_sent_local_and_unsent_rows_counting_only_abandoned() {
+        let path = temp_path("count-all-rows");
+        let mut store = Store::open(
+            PersistenceConfig::new(1024 * 1024)
+                .path(path.clone())
+                .max_events(3),
+            &path,
+        )
+        .expect("open store");
+        insert_sent_local_unsent(&mut store, "row", now_millis());
+        let next = event("next");
+        let mut evicted = Vec::new();
+        for _ in 0..3 {
+            let outcome = store
+                .insert_at(&next.0, &next.1, now_millis(), false)
+                .expect("insert with count eviction");
+            evicted.push((outcome.evicted_count, outcome.abandoned));
+        }
+
+        // Oldest first: the sent row, then the local-only row, then the unsent
+        // upload row, whose eviction alone is an abandoned upload.
+        assert_eq!(evicted, vec![(1, 0), (1, 0), (1, 1)]);
+        assert_eq!(store.pending_totals().expect("totals").0, 3);
+        assert_totals_consistent(&store);
+        let _ = fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    #[test]
+    fn storage_retention_removes_sent_local_and_unsent_rows_counting_only_abandoned() {
+        let path = temp_path("storage-all-rows");
+        let value = "x".repeat(30 * 1024);
+        let mut store = Store::open(PersistenceConfig::new(160 * 1024).path(path.clone()), &path)
+            .expect("open store");
+        insert_sent_local_unsent(&mut store, &value, now_millis());
+        let next = event(&value);
+        let mut evicted = Vec::new();
+        for _ in 0..3 {
+            let outcome = store
+                .insert_at(&next.0, &next.1, now_millis(), true)
+                .expect("a spool full of sent rows still admits new rows");
+            evicted.push((outcome.evicted_storage, outcome.abandoned));
+        }
+
+        assert_eq!(evicted, vec![(1, 0), (1, 0), (1, 1)]);
+        assert_totals_consistent(&store);
+        let _ = fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    #[test]
+    fn startup_retention_removes_sent_and_local_rows() {
+        let path = temp_path("startup-all-rows");
+        let mut store = Store::open(
+            PersistenceConfig::new(1024 * 1024).path(path.clone()),
+            &path,
+        )
+        .expect("open store");
+        insert_sent_local_unsent(&mut store, "startup", 1);
+        drop(store);
+        let mut reopened = Store::open(
+            PersistenceConfig::new(1024 * 1024)
+                .path(path.clone())
+                .max_events(1),
+            &path,
+        )
+        .expect("reopen with lower limit");
+
+        let outcome = reopened
+            .enforce_existing_limits(now_millis())
+            .expect("enforce limits");
+
+        assert_eq!((outcome.evicted_count, outcome.abandoned), (2, 0));
+        assert_eq!(reopened.row_flags().expect("flags"), vec![(true, false)]);
+        assert_totals_consistent(&reopened);
+        let _ = fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    #[test]
+    fn retention_skips_assigned_batch_but_removes_older_sent_rows() {
+        let path = temp_path("assigned-vs-sent");
+        let mut store = Store::open(
+            PersistenceConfig::new(1024 * 1024)
+                .path(path.clone())
+                .max_events(2),
+            &path,
+        )
+        .expect("open store");
+        let item = event("row");
+        store.insert(&item.0, &item.1).expect("insert sent row");
+        let sent = store
+            .next_batch(1, usize::MAX, true)
+            .expect("assign")
+            .expect("batch");
+        store.acknowledge(sent.sequence_id).expect("ack");
+        store.insert(&item.0, &item.1).expect("insert assigned row");
+        let assigned = store
+            .next_batch(1, usize::MAX, true)
+            .expect("assign")
+            .expect("batch");
+
+        let first = store.insert(&item.0, &item.1).expect("evicts the sent row");
+        assert_eq!((first.evicted_count, first.abandoned), (1, 0));
+        let second = store
+            .insert(&item.0, &item.1)
+            .expect("evicts the unsent row, not the older assigned batch");
+        assert_eq!((second.evicted_count, second.abandoned), (1, 1));
+        assert_eq!(
+            store.row_flags().expect("flags"),
+            vec![(true, false), (true, false)]
+        );
+        let retained = store
+            .next_batch(1, usize::MAX, true)
+            .expect("reload")
+            .expect("assigned batch retained");
+        assert_eq!(retained.sequence_id, assigned.sequence_id);
+        assert_totals_consistent(&store);
+        let _ = fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    /// Measures WAL frames per single-event commit and per acknowledged batch.
+    /// Run with `cargo test -p aliyun-sls --features persist --release --
+    /// --ignored --nocapture wal_frames_per_event`.
+    #[test]
+    #[ignore = "measurement harness, prints WAL frame counts"]
+    fn wal_frames_per_event() {
+        fn frames(store: &Store) -> i64 {
+            store
+                .connection
+                .query_row("PRAGMA wal_checkpoint", [], |row| row.get::<_, i64>(1))
+                .expect("read WAL frames")
+        }
+        fn reset(store: &Store) {
+            store
+                .connection
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+                .expect("truncate WAL");
+        }
+        let events = 20_000;
+        let path = temp_path("wal-frames");
+        let mut store = Store::open(
+            PersistenceConfig::new(1024 * 1024 * 1024).path(path.clone()),
+            &path,
+        )
+        .expect("open store");
+        store
+            .connection
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("disable auto checkpoint");
+        let item = event(&"p".repeat(400));
+        for _ in 0..2_000 {
+            store.insert(&item.0, &item.1).expect("preload");
+        }
+        reset(&store);
+        for _ in 0..events {
+            store.insert(&item.0, &item.1).expect("insert");
+        }
+        let insert_frames = frames(&store);
+        reset(&store);
+        for _ in 0..events {
+            store
+                .insert_at(&item.0, &item.1, now_millis(), false)
+                .expect("insert local-only");
+        }
+        let local_frames = frames(&store);
+        reset(&store);
+        for _ in 0..10 {
+            let batch = store
+                .next_batch(100, usize::MAX, true)
+                .expect("assign")
+                .expect("batch");
+            store.acknowledge(batch.sequence_id).expect("ack");
+        }
+        let ack_frames = frames(&store);
+        println!(
+            "upload-row insert: {insert_frames} frames / {events} events = {:.2} frames/event",
+            insert_frames as f64 / events as f64
+        );
+        println!(
+            "local-only insert: {local_frames} frames / {events} events = {:.2} frames/event",
+            local_frames as f64 / events as f64
+        );
+        println!("assign+ack: {ack_frames} frames / 10 batches of 100");
+        drop(store);
+        let _ = fs::remove_dir_all(path.parent().expect("temporary parent"));
     }
 
     #[cfg(unix)]

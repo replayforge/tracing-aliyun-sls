@@ -14,5 +14,5 @@ pub mod tags;
 /// Time utilities for recording timestamps.
 pub mod time;
 
-pub use aliyun_sls::{SlsClient, reporter};
+pub use aliyun_sls::{Log, MayStaticKey, SlsClient, reporter};
 pub use layer::layer;

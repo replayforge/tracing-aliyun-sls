@@ -106,6 +106,10 @@ pub enum ReportResult {
     /// configured limit, or SQLite failed before commit.
     #[cfg(feature = "persist")]
     PersistenceFailed,
+    /// The caller marked the log local-only, but this reporter has no
+    /// persistent spool, so the log was neither stored nor uploaded.
+    #[cfg(feature = "persist")]
+    NotStored,
 }
 
 /// A point-in-time copy of reporter counters.
@@ -145,7 +149,9 @@ pub struct ReporterStatsSnapshot {
     /// Logs rejected because persistent admission or SQLite failed.
     #[cfg(feature = "persist")]
     pub persistence_failed: u64,
-    /// Rows evicted by the configured maximum event count.
+    /// Rows evicted by the configured maximum event count. Like the other
+    /// `persistence_evicted_*` counters this includes sent and local-only rows;
+    /// see `persistence_abandoned` for evicted rows that were never uploaded.
     #[cfg(feature = "persist")]
     pub persistence_evicted_count: u64,
     /// Rows evicted by the configured maximum age.
@@ -157,13 +163,21 @@ pub struct ReporterStatsSnapshot {
     /// Payload bytes removed while enforcing persistence limits.
     #[cfg(feature = "persist")]
     pub persistence_evicted_bytes: u64,
-    /// Rows decoded and recovered when the persistent spool was opened.
+    /// Evicted rows that were marked for upload but had not been sent: their
+    /// upload was abandoned. These are also counted in `dropped`; evicting a
+    /// sent or local-only row is not.
+    #[cfg(feature = "persist")]
+    pub persistence_abandoned: u64,
+    /// Unsent upload rows decoded and recovered when the persistent spool was
+    /// opened.
     #[cfg(feature = "persist")]
     pub persistence_recovered_rows: u64,
-    /// Rows currently pending in the persistent spool.
+    /// Rows currently stored in the persistent spool, including sent and
+    /// local-only rows kept as local history.
     #[cfg(feature = "persist")]
     pub persistence_pending_rows: u64,
-    /// Serialized event bytes currently pending in the persistent spool.
+    /// Serialized event bytes currently stored in the persistent spool,
+    /// including sent and local-only rows.
     #[cfg(feature = "persist")]
     pub persistence_pending_bytes: u64,
     /// Recovered logs delivered from a batch assigned before this process.
@@ -228,6 +242,8 @@ pub(crate) struct Stats {
     pub(crate) persistence_evicted_storage: AtomicU64,
     #[cfg(feature = "persist")]
     pub(crate) persistence_evicted_bytes: AtomicU64,
+    #[cfg(feature = "persist")]
+    pub(crate) persistence_abandoned: AtomicU64,
     #[cfg(feature = "persist")]
     pub(crate) persistence_recovered_rows: AtomicU64,
     #[cfg(feature = "persist")]
@@ -583,60 +599,17 @@ impl Reporter {
     /// capacity, but it synchronously waits for the dedicated writer to commit
     /// the SQLite transaction. Queue or SQLite errors immediately return
     /// [`ReportResult::PersistenceFailed`].
+    ///
+    /// The log is marked for upload; this is the same as
+    /// [`Reporter::try_report_with_upload`] with `upload = true`.
     pub fn try_report(&self, metadata: Arc<LogGroupMetadata>, log: Log) -> ReportResult {
         self.state.stats.received.fetch_add(1, Ordering::Relaxed);
-        if self.state.is_closing() {
-            self.state
-                .stats
-                .queue_closed
-                .fetch_add(1, Ordering::Relaxed);
-            self.state.stats.dropped.fetch_add(1, Ordering::Relaxed);
-            return ReportResult::Closed;
+        if let Some(closed) = self.reject_if_closing() {
+            return closed;
         }
         #[cfg(feature = "persist")]
         if let Some(persistence) = &self.persistence {
-            if calc_log_group_metadata_encoded_len(&metadata)
-                .saturating_add(calc_log_group_log_encoded_len(&log))
-                > self.config.batch_max_bytes
-            {
-                self.state.stats.oversized.fetch_add(1, Ordering::Relaxed);
-                self.state
-                    .stats
-                    .persistence_failed
-                    .fetch_add(1, Ordering::Relaxed);
-                self.state.stats.dropped.fetch_add(1, Ordering::Relaxed);
-                return ReportResult::PersistenceFailed;
-            }
-            return match persistence.commit(metadata, log, &self.state) {
-                Ok(()) => {
-                    self.state.stats.accepted.fetch_add(1, Ordering::Relaxed);
-                    self.state
-                        .stats
-                        .persistence_committed
-                        .fetch_add(1, Ordering::Relaxed);
-                    ReportResult::Accepted
-                }
-                Err(failure) => {
-                    match failure {
-                        AdmissionFailure::Full => {
-                            self.state.stats.queue_full.fetch_add(1, Ordering::Relaxed);
-                        }
-                        AdmissionFailure::Closed => {
-                            self.state
-                                .stats
-                                .queue_closed
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        AdmissionFailure::Store => {}
-                    }
-                    self.state
-                        .stats
-                        .persistence_failed
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.state.stats.dropped.fetch_add(1, Ordering::Relaxed);
-                    ReportResult::PersistenceFailed
-                }
-            };
+            return self.admit_persistent(persistence, metadata, log, true);
         }
         match self.producer.try_send((metadata, log)) {
             Ok(()) => {
@@ -656,6 +629,110 @@ impl Reporter {
                     .fetch_add(1, Ordering::Relaxed);
                 self.state.stats.dropped.fetch_add(1, Ordering::Relaxed);
                 ReportResult::Closed
+            }
+        }
+    }
+
+    /// Report a log with a per-event upload decision, discarding the result.
+    ///
+    /// Use [`Reporter::try_report_with_upload`] when the result must be
+    /// observed.
+    #[cfg(feature = "persist")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "persist")))]
+    pub fn report_with_upload(&self, metadata: Arc<LogGroupMetadata>, log: Log, upload: bool) {
+        let _ = self.try_report_with_upload(metadata, log, upload);
+    }
+
+    /// Attempt to admit a log with a per-event upload decision.
+    ///
+    /// `upload = true` behaves exactly like [`Reporter::try_report`].
+    ///
+    /// `upload = false` stores the log in the persistent spool as local
+    /// history only: it is committed like any other row and removed by the
+    /// configured retention, but it is never assigned to an upload batch. On a
+    /// reporter without a persistent spool there is nowhere to keep such a log,
+    /// so it is discarded and [`ReportResult::NotStored`] is returned.
+    #[cfg(feature = "persist")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "persist")))]
+    pub fn try_report_with_upload(
+        &self,
+        metadata: Arc<LogGroupMetadata>,
+        log: Log,
+        upload: bool,
+    ) -> ReportResult {
+        if upload {
+            return self.try_report(metadata, log);
+        }
+        self.state.stats.received.fetch_add(1, Ordering::Relaxed);
+        if let Some(closed) = self.reject_if_closing() {
+            return closed;
+        }
+        match &self.persistence {
+            Some(persistence) => self.admit_persistent(persistence, metadata, log, false),
+            None => ReportResult::NotStored,
+        }
+    }
+
+    fn reject_if_closing(&self) -> Option<ReportResult> {
+        if !self.state.is_closing() {
+            return None;
+        }
+        self.state
+            .stats
+            .queue_closed
+            .fetch_add(1, Ordering::Relaxed);
+        self.state.stats.dropped.fetch_add(1, Ordering::Relaxed);
+        Some(ReportResult::Closed)
+    }
+
+    #[cfg(feature = "persist")]
+    fn admit_persistent(
+        &self,
+        persistence: &PersistenceSender,
+        metadata: Arc<LogGroupMetadata>,
+        log: Log,
+        upload: bool,
+    ) -> ReportResult {
+        if calc_log_group_metadata_encoded_len(&metadata)
+            .saturating_add(calc_log_group_log_encoded_len(&log))
+            > self.config.batch_max_bytes
+        {
+            self.state.stats.oversized.fetch_add(1, Ordering::Relaxed);
+            self.state
+                .stats
+                .persistence_failed
+                .fetch_add(1, Ordering::Relaxed);
+            self.state.stats.dropped.fetch_add(1, Ordering::Relaxed);
+            return ReportResult::PersistenceFailed;
+        }
+        match persistence.commit(metadata, log, upload, &self.state) {
+            Ok(()) => {
+                self.state.stats.accepted.fetch_add(1, Ordering::Relaxed);
+                self.state
+                    .stats
+                    .persistence_committed
+                    .fetch_add(1, Ordering::Relaxed);
+                ReportResult::Accepted
+            }
+            Err(failure) => {
+                match failure {
+                    AdmissionFailure::Full => {
+                        self.state.stats.queue_full.fetch_add(1, Ordering::Relaxed);
+                    }
+                    AdmissionFailure::Closed => {
+                        self.state
+                            .stats
+                            .queue_closed
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    AdmissionFailure::Store => {}
+                }
+                self.state
+                    .stats
+                    .persistence_failed
+                    .fetch_add(1, Ordering::Relaxed);
+                self.state.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                ReportResult::PersistenceFailed
             }
         }
     }
@@ -1306,6 +1383,8 @@ impl State {
                 .load(Ordering::Relaxed),
             #[cfg(feature = "persist")]
             persistence_evicted_bytes: self.stats.persistence_evicted_bytes.load(Ordering::Relaxed),
+            #[cfg(feature = "persist")]
+            persistence_abandoned: self.stats.persistence_abandoned.load(Ordering::Relaxed),
             #[cfg(feature = "persist")]
             persistence_recovered_rows: self
                 .stats
@@ -1969,7 +2048,7 @@ mod tests {
         .expect("start persistence");
         let (metadata, log) = item(1);
         assert!(
-            persistence.commit(metadata, log, &state).is_ok(),
+            persistence.commit(metadata, log, true, &state).is_ok(),
             "commit event"
         );
         let batch = persistence
@@ -2000,6 +2079,223 @@ mod tests {
         assert_eq!(retained.sequence_id, batch.sequence_id);
         assert_eq!(retained.logs, batch.logs);
         drop(persistence);
+        let _ = std::fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    #[cfg(feature = "persist")]
+    #[test]
+    fn upload_flag_is_stored_per_row_and_local_only_needs_a_spool() {
+        let path = persistence_test_path("upload-flag");
+        let reporter = Reporter::builder(client())
+            .build_with_persistence(PersistenceConfig::new(1024 * 1024).path(path.clone()))
+            .expect("build persistent reporter");
+        for (index, upload) in [(1, None), (2, Some(false)), (3, Some(true))] {
+            let (metadata, log) = item(index);
+            let result = match upload {
+                None => reporter.try_report(metadata, log),
+                Some(upload) => reporter.try_report_with_upload(metadata, log, upload),
+            };
+            assert_eq!(result, ReportResult::Accepted);
+        }
+        let connection = rusqlite::Connection::open(&path).expect("open spool");
+        let flags = connection
+            .prepare("SELECT upload FROM pending_events ORDER BY id")
+            .expect("prepare")
+            .query_map([], |row| row.get::<_, bool>(0))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("flags");
+        assert_eq!(flags, vec![true, false, true]);
+        drop(connection);
+        drop(reporter);
+
+        let memory = Reporter::builder(client()).build();
+        let (metadata, log) = item(4);
+        assert_eq!(
+            memory.try_report_with_upload(metadata, log, false),
+            ReportResult::NotStored
+        );
+        let stats = memory.stats();
+        assert_eq!(
+            (stats.received, stats.accepted, stats.queue_depth),
+            (1, 0, 0)
+        );
+        let _ = std::fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    /// One idempotent request seen by [`RecordingSink`]:
+    /// `(spool_id, sequence_id, log count)`.
+    #[cfg(feature = "persist")]
+    type RecordedCall = (Vec<u8>, u64, usize);
+
+    /// Fake SLS endpoint that accepts every idempotent request and records it.
+    #[cfg(feature = "persist")]
+    #[derive(Clone, Default)]
+    struct RecordingSink {
+        calls: Arc<Mutex<Vec<RecordedCall>>>,
+    }
+
+    #[cfg(feature = "persist")]
+    impl PersistentLogSink for RecordingSink {
+        fn send_idempotent<'a>(
+            &'a self,
+            _metadata: &'a LogGroupMetadata,
+            logs: &'a [Log],
+            spool_id: &'a [u8],
+            sequence_id: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<(), SlsClientError>> + Send + 'a>> {
+            self.calls.lock().expect("record call").push((
+                spool_id.to_vec(),
+                sequence_id,
+                logs.len(),
+            ));
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[cfg(feature = "persist")]
+    const CRASH_CHILD_ENV: &str = "ALIYUN_SLS_REPORTER_CRASH_CHILD";
+
+    #[cfg(feature = "persist")]
+    fn start_spool(path: &std::path::Path, state: Arc<State>) -> Arc<PersistenceSender> {
+        PersistenceSender::start(
+            PersistenceConfig::new(1024 * 1024).path(path.to_path_buf()),
+            8,
+            b"crash-destination".to_vec().into_boxed_slice(),
+            state,
+        )
+        .expect("start persistence")
+    }
+
+    /// Child half of the `kill -9` tests. `queued` commits one upload row and
+    /// one local-only row; `remote-ack` additionally assigns the upload row
+    /// and has the fake SLS accept it, then stops before local acknowledgement.
+    #[cfg(feature = "persist")]
+    #[tokio::test]
+    async fn crash_child_entry() {
+        let Ok(spec) = std::env::var(CRASH_CHILD_ENV) else {
+            return;
+        };
+        let (mode, path) = spec.split_once(':').expect("mode:path");
+        let state = Arc::new(State::default());
+        let persistence = start_spool(std::path::Path::new(path), state.clone());
+        let (metadata, log) = item(1);
+        assert!(persistence.commit(metadata, log, true, &state).is_ok());
+        let (metadata, log) = item(2);
+        assert!(persistence.commit(metadata, log, false, &state).is_ok());
+        if mode == "remote-ack" {
+            let batch = persistence
+                .next_batch(10, usize::MAX, true)
+                .await
+                .expect("assign")
+                .expect("batch");
+            let sink = RecordingSink::default();
+            assert!(persistent_send_cycle(&sink, &batch, &ReporterConfig::default(), &state).await);
+            let spool: String = hex::encode(&batch.spool_id);
+            println!("CHILD-READY seq={} spool={spool}", batch.sequence_id);
+        } else {
+            println!("CHILD-READY");
+        }
+        std::io::Write::flush(&mut std::io::stdout()).expect("flush");
+        std::thread::park();
+    }
+
+    /// Run the child in `mode`, SIGKILL it once it reports readiness, and
+    /// return the readiness line.
+    #[cfg(feature = "persist")]
+    fn run_and_kill_child(mode: &str, path: &std::path::Path) -> String {
+        use std::io::BufRead;
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "reporter::tests::crash_child_entry",
+                "--nocapture",
+            ])
+            .env(CRASH_CHILD_ENV, format!("{mode}:{}", path.display()))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("spawn child");
+        let stdout = child.stdout.take().expect("child stdout");
+        let ready = std::io::BufReader::new(stdout)
+            .lines()
+            .map(|line| line.expect("read child"))
+            .find(|line| line.contains("CHILD-READY"))
+            .expect("child readiness");
+        child.kill().expect("SIGKILL child");
+        let _ = child.wait().expect("reap child");
+        ready
+    }
+
+    /// Reopen the spool, upload what is due through a recording fake SLS, and
+    /// acknowledge it. Returns the recorded calls.
+    #[cfg(feature = "persist")]
+    async fn reopen_and_upload(path: &std::path::Path) -> Vec<RecordedCall> {
+        let state = Arc::new(State::default());
+        let persistence = start_spool(path, state.clone());
+        assert_eq!(state.snapshot().persistence_recovered_rows, 1);
+        assert_eq!(state.snapshot().persistence_pending_rows, 2);
+        let batch = persistence
+            .next_batch(10, usize::MAX, false)
+            .await
+            .expect("next batch")
+            .expect("recovered row bypasses linger");
+        let sink = RecordingSink::default();
+        let config = ReporterConfig::default();
+        assert!(persistent_send_cycle(&sink, &batch, &config, &state).await);
+        finish_persistent_cycle(&persistence, &batch, true, &state).await;
+        assert_eq!(state.snapshot().sent, 1);
+        drop(persistence);
+
+        let after = Arc::new(State::default());
+        let persistence = start_spool(path, after.clone());
+        assert_eq!(after.snapshot().persistence_recovered_rows, 0);
+        assert!(
+            persistence
+                .next_batch(10, usize::MAX, true)
+                .await
+                .expect("next batch")
+                .is_none(),
+            "acknowledged row is not resent and local-only row is never sent"
+        );
+        assert_eq!(after.snapshot().persistence_pending_rows, 2);
+        let calls = sink.calls.lock().expect("calls").clone();
+        calls
+    }
+
+    #[cfg(feature = "persist")]
+    #[tokio::test]
+    async fn killed_after_commit_before_send_uploads_after_restart() {
+        let path = persistence_test_path("kill-before-send");
+        run_and_kill_child("queued", &path);
+
+        let calls = reopen_and_upload(&path).await;
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            (calls[0].1, calls[0].2),
+            (1, 1),
+            "first seqid, upload row only"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    #[cfg(feature = "persist")]
+    #[tokio::test]
+    async fn killed_after_remote_ack_before_local_ack_resends_same_seqid() {
+        let path = persistence_test_path("kill-after-remote-ack");
+        let ready = run_and_kill_child("remote-ack", &path);
+
+        let calls = reopen_and_upload(&path).await;
+
+        assert_eq!(calls.len(), 1);
+        let spool: String = hex::encode(&calls[0].0);
+        assert_eq!(
+            ready,
+            format!("CHILD-READY seq={} spool={spool}", calls[0].1),
+            "restart resends with the seqid and spool key SLS already received"
+        );
+        assert_eq!(calls[0].2, 1);
         let _ = std::fs::remove_dir_all(path.parent().expect("temporary parent"));
     }
 

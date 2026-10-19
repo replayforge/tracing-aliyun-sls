@@ -29,6 +29,9 @@ compact_str.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["std"] }
 
+[dev-dependencies]
+tracing-subscriber = { workspace = true, features = ["registry"] }
+
 [features]
 default = ["reqwest-default-tls"]
 

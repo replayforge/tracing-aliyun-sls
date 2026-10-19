@@ -85,8 +85,21 @@ but does synchronously wait for the SQLite commit. A full/closed persistence
 command queue, serialization/limit rejection, or SQLite error immediately
 returns `ReportResult::PersistenceFailed`.
 
-Retention evicts the oldest eligible unassigned rows by age, count, then
-storage pressure; assigned rows cannot be evicted. The SQLite physical budget
+Each row has a caller-chosen `upload` flag and a `sent` marker.
+`Reporter::try_report` and `report` mark the row for upload (the default, same
+as before the flag existed); `Reporter::try_report_with_upload(.., false)` and
+`report_with_upload` store a local-only row that is never uploaded. Without a
+persistent spool a local-only row is discarded and
+`ReportResult::NotStored` is returned. Only `upload = 1` rows that are not yet
+sent are batched. Acknowledged rows are marked `sent = 1` and kept as local
+history.
+
+Retention evicts the oldest rows by age, count, then storage pressure, over all
+rows (sent, local-only, waiting for upload); the assigned batch cannot be
+evicted. Sent and local-only rows therefore never block new admissions. An
+evicted row that was marked for upload but not yet sent is an abandoned upload:
+it is counted in `persistence_abandoned` and `dropped`, while every evicted row
+is counted in the per-reason `persistence_evicted_*` counters. The SQLite physical budget
 is a conservative target, not an exact byte cap: WAL checkpoint timing,
 filesystem allocation, and an assigned batch can make `.db` + `.wal` + `.shm`
 larger. CPU includes serialization and SQLite work. Memory is bounded by the
@@ -99,12 +112,13 @@ the same spool key and monotonic `seqid`; retry deduplication relies on SLS
 route-key/`seqid` behavior. Unavailable SLS, retry exhaustion, timeout,
 shutdown deadline, and restart retain the batch. If remote acknowledgement
 happens before local SQLite acknowledgement, restart resends the same batch
-and `seqid`; only the local acknowledgement transaction deletes it. Graceful
+and `seqid`; only the local acknowledgement transaction marks it sent. Graceful
 shutdown drains until its configured deadline.
 
 `Reporter::stats()` includes committed/failed persistent admissions,
-count/age/storage evictions and evicted bytes, recovered/replayed rows, pending
-rows/serialized bytes, and failed durable upload cycles. Stats are
+count/age/storage evictions and evicted bytes, abandoned uploads, recovered
+unsent rows, replayed rows, stored rows/serialized bytes (including sent and
+local-only rows), and failed durable upload cycles. Stats are
 process-local. Stored payloads include all log content, topic, source, and
 tags; do not record secrets or sensitive data without treating the spool as
 sensitive storage.
