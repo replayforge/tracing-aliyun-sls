@@ -803,3 +803,26 @@ recording fake sink receives the row with the expected `seqid` and spool key.
 Mutations reverting acknowledgement to `DELETE`, dropping the `upload = 1`
 batch filter, or restricting retention to unassigned rows each fail several of
 these tests.
+
+### Follow-up (2026-10-19)
+
+- **Upload decision panics** are caught in `on_event` with `catch_unwind`; the
+  event is then marked for upload, the same as without a decision. A panic in
+  application code on the logging path therefore cannot unwind into the
+  emitting caller, and the failure mode only uploads more. Propagating the
+  panic was rejected because a log statement would then abort the caller's
+  task or thread. `AssertUnwindSafe` is sound here because only `log`, which
+  is valid in any partially edited state, is used after a caught panic. With
+  `panic = "abort"` nothing is caught.
+- **`persistence_unsent_rows`** (new, additive) is the upload backlog: rows
+  with `upload = 1 AND sent = 0`, including the assigned batch. It is seeded
+  from the rows recovered at open and updated by the writer thread from each
+  applied outcome: `+1` per committed upload row, `-abandoned`, `-acknowledged`
+  (rows acknowledgement changed from unsent to sent).
+- **Counter relations** are documented on `ReporterStatsSnapshot::received`
+  and `::dropped`: every admission call adds one to `received` and is either
+  accepted, rejected (in `dropped`), or `NotStored` (in neither); `dropped`
+  additionally counts accepted logs lost later.
+- **Wake-up tests**: a committed group of local-only rows does not wake the
+  uploader, a group containing an upload row does, and a waiting
+  `next_persistent_batch` returns the new upload row.

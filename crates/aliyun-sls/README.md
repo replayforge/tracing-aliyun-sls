@@ -118,8 +118,10 @@ shutdown drains until its configured deadline.
 `Reporter::stats()` includes committed/failed persistent admissions,
 count/age/storage evictions and evicted bytes, abandoned uploads, recovered
 unsent rows, replayed rows, stored rows/serialized bytes (including sent and
-local-only rows), and failed durable upload cycles. Stats are
-process-local. Stored payloads include all log content, topic, source, and
+local-only rows), the upload backlog (`persistence_unsent_rows`), and failed
+durable upload cycles. `received` is not `accepted + dropped`; the
+`ReporterStatsSnapshot` field documentation explains how the counters relate.
+Stats are process-local. Stored payloads include all log content, topic, source, and
 tags; do not record secrets or sensitive data without treating the spool as
 sensitive storage.
 

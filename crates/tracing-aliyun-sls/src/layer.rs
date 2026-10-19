@@ -268,10 +268,33 @@ impl<S, FT, T, E> Layer<S, FT, T, E> {
     ///
     /// `decide` runs on the thread that emitted the event, so it inherits the
     /// `on_event` constraints: it must not perform network I/O, sleep, block
-    /// on a channel or lock held across I/O, emit `tracing` events (they would
-    /// re-enter subscribers), or panic. Synthesized span lifecycle events
+    /// on a channel or lock held across I/O, or emit `tracing` events (they
+    /// would re-enter subscribers). Synthesized span lifecycle events
     /// (see [`Layer::with_span_events`]) have no [`Event`] and are always
     /// admitted for upload.
+    ///
+    /// # Panics
+    ///
+    /// A panic in `decide` does not reach the code that emitted the event: the
+    /// layer catches it and admits that event for upload, as if no decision
+    /// were installed, so a faulty decision can only upload more, never lose
+    /// an event. Any fields `decide` added to `log` before panicking are kept.
+    /// The panic message still goes to the panic hook (stderr by default).
+    /// State that `decide` shares across events stays as the panic left it;
+    /// for example a `std::sync::Mutex` held during the panic is poisoned, and
+    /// a `decide` that calls `lock().unwrap()` then panics, and so uploads,
+    /// on every later event. Recover the guard instead:
+    ///
+    /// ```ignore
+    /// let skipped = Mutex::new(0u64);
+    /// layer.with_upload_decision(move |event, log| {
+    ///     let mut skipped = skipped.lock().unwrap_or_else(|e| e.into_inner());
+    ///     // ...
+    /// })
+    /// ```
+    ///
+    /// With `panic = "abort"` there is nothing to catch and the process
+    /// aborts.
     #[cfg(feature = "persist")]
     #[cfg_attr(docsrs, doc(cfg(feature = "persist")))]
     pub fn with_upload_decision<F>(self, decide: F) -> Self
@@ -376,7 +399,13 @@ where
 
         #[cfg(feature = "persist")]
         if let Some(decide) = &self.upload_decision {
-            let upload = decide(event, &mut log);
+            // A panicking decision must not unwind into the code that emitted
+            // the event; fall back to the no-decision behavior (upload).
+            // `AssertUnwindSafe`: after a panic only `log` is used again, and a
+            // partially edited log is still a valid log to upload.
+            let upload =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decide(event, &mut log)))
+                    .unwrap_or(true);
             self.reporter.report_with_upload(metadata, log, upload);
             return;
         }
@@ -628,6 +657,46 @@ mod tests {
         );
         let stats = reporter.stats();
         assert_eq!((stats.received, stats.accepted), (2, 1));
+    }
+
+    #[cfg(feature = "persist")]
+    #[test]
+    fn panicking_upload_decision_uploads_and_keeps_reporting() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let client = aliyun_sls::SlsClient::builder()
+            .access_key("key")
+            .access_secret("secret")
+            .expect("valid test secret")
+            .endpoint("example.com")
+            .project("project")
+            .logstore("logstore")
+            .enable_trace(false)
+            .build()
+            .expect("complete test client");
+        // Memory-only: `accepted` counts events admitted for upload, while a
+        // local-only decision would be `NotStored` and not accepted.
+        let reporter = Reporter::builder(client).build();
+        let layer = layer(reporter.clone()).with_upload_decision(|event, _log| {
+            if *event.metadata().level() == tracing::Level::ERROR {
+                panic!("faulty upload decision");
+            }
+            false
+        });
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!("decision panics");
+            tracing::info!("decided local-only after the panic");
+            tracing::error!("decision panics again");
+        });
+
+        let stats = reporter.stats();
+        assert_eq!(
+            (stats.received, stats.accepted),
+            (3, 2),
+            "both panicking decisions fall back to upload; the reporter keeps receiving"
+        );
     }
 
     #[test]

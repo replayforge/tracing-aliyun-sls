@@ -227,6 +227,10 @@ pub(crate) struct InsertOutcome {
     /// Subset of the evicted rows that were marked for upload but not yet
     /// sent; their upload is abandoned.
     pub(crate) abandoned: u64,
+    /// 1 when this outcome inserted a row marked for upload, else 0.
+    pub(crate) queued_upload: u64,
+    /// Rows this outcome marked sent (SLS acknowledged their batch).
+    pub(crate) acknowledged: u64,
     pub(crate) pending_rows: u64,
     pub(crate) pending_bytes: u64,
 }
@@ -280,6 +284,13 @@ impl PersistenceSender {
                                     .stats
                                     .persistence_pending_bytes
                                     .store(bytes, Ordering::Relaxed);
+                                // Every recovered row is an unsent upload row,
+                                // so this seeds the backlog gauge that
+                                // `update_persistence_stats` keeps current.
+                                state
+                                    .stats
+                                    .persistence_unsent_rows
+                                    .store(recovered, Ordering::Relaxed);
                                 if startup_sender.send(Ok(())).is_ok() {
                                     writer_loop(&mut store, receiver, wake_sender, &state);
                                 }
@@ -376,6 +387,12 @@ impl PersistenceSender {
 
     pub(crate) async fn notified(&self) {
         let _ = self.wake_receiver.recv().await;
+    }
+
+    /// Whether a wake-up is pending, consuming it.
+    #[cfg(test)]
+    pub(crate) fn take_wake(&self) -> bool {
+        self.wake_receiver.try_recv().is_ok()
     }
 }
 
@@ -543,6 +560,19 @@ fn update_persistence_stats(state: &State, outcome: &InsertOutcome) {
         .stats
         .persistence_pending_bytes
         .store(outcome.pending_bytes, Ordering::Relaxed);
+    // Only the writer thread applies outcomes, so this read-modify-write does
+    // not race with another update of the backlog gauge.
+    let _ = state.stats.persistence_unsent_rows.fetch_update(
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+        |rows| {
+            Some(
+                rows.saturating_add(outcome.queued_upload)
+                    .saturating_sub(outcome.abandoned)
+                    .saturating_sub(outcome.acknowledged),
+            )
+        },
+    );
     // Removing a sent or local-only row is ordinary retention; only rows whose
     // upload is abandoned are lost telemetry.
     state
@@ -897,6 +927,7 @@ impl Store {
                 i64::try_from(payload.len()).unwrap_or(i64::MAX),
                 upload
             ])?;
+        outcome.queued_upload = u64::from(upload);
         outcome.pending_rows = pending_rows.saturating_add(1);
         outcome.pending_bytes = pending_bytes.saturating_add(payload.len() as u64);
         set_state_totals(connection, outcome.pending_rows, outcome.pending_bytes)?;
@@ -1077,8 +1108,10 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let sequence_id = i64::try_from(sequence_id).unwrap_or(i64::MAX);
-        transaction.execute(
-            "UPDATE pending_events SET sent = 1 WHERE batch_seq = ?1",
+        // `sent = 0` only narrows the count to rows this call changes; marking
+        // an already sent row again would not change it.
+        let acknowledged = transaction.execute(
+            "UPDATE pending_events SET sent = 1 WHERE batch_seq = ?1 AND sent = 0",
             params![sequence_id],
         )?;
         transaction.execute(
@@ -1088,6 +1121,7 @@ impl Store {
         let (pending_rows, pending_bytes) = state_totals(&transaction)?;
         transaction.commit()?;
         Ok(InsertOutcome {
+            acknowledged: acknowledged as u64,
             pending_rows,
             pending_bytes,
             ..InsertOutcome::default()
@@ -2210,6 +2244,10 @@ mod tests {
     #[test]
     fn retention_counters_drop_only_abandoned_rows() {
         let state = State::default();
+        state
+            .stats
+            .persistence_unsent_rows
+            .store(10, Ordering::Relaxed);
         update_persistence_stats(
             &state,
             &InsertOutcome {
@@ -2218,9 +2256,16 @@ mod tests {
                 evicted_storage: 4,
                 evicted_bytes: 512,
                 abandoned: 6,
+                queued_upload: 1,
+                acknowledged: 2,
                 pending_rows: 5,
                 pending_bytes: 1_024,
             },
+        );
+        assert_eq!(
+            state.stats.persistence_unsent_rows.load(Ordering::Relaxed),
+            10 + 1 - 6 - 2,
+            "backlog gains the queued row and loses abandoned and acknowledged rows"
         );
 
         assert_eq!(

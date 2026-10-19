@@ -117,8 +117,24 @@ pub enum ReportResult {
 #[non_exhaustive]
 pub struct ReporterStatsSnapshot {
     /// Logs presented to the reporter, including rejected logs.
+    ///
+    /// Every admission call (`try_report`, `report`, and with `persist`
+    /// `try_report_with_upload`/`report_with_upload`) adds exactly one, and
+    /// ends in exactly one of three ways:
+    ///
+    /// - accepted: counted in `accepted`;
+    /// - rejected at admission (full, closed, oversized in persistent mode,
+    ///   or a persistence failure): counted in `dropped`;
+    /// - `ReportResult::NotStored` (a local-only log without a persistent
+    ///   spool): counted in neither.
+    ///
+    /// So `received >= accepted + admission rejections`, with equality when
+    /// no call returned `NotStored`. `received` is not
+    /// `accepted + dropped`: `dropped` also counts accepted logs that were lost
+    /// later (see `dropped`).
     pub received: u64,
-    /// Logs accepted into the queue.
+    /// Logs accepted into the in-memory queue or committed to the persistent
+    /// spool.
     pub accepted: u64,
     /// Logs rejected because the queue was full.
     pub queue_full: u64,
@@ -136,8 +152,20 @@ pub struct ReporterStatsSnapshot {
     pub send_failed: u64,
     /// Logs larger than the configured maximum batch size.
     pub oversized: u64,
-    /// Logs dropped at admission, by persistence retention, after send failure,
-    /// or at shutdown deadline.
+    /// Logs that will never reach SLS, counted once each:
+    ///
+    /// - rejected at admission (see `received`);
+    /// - in-memory mode only: accepted but then found oversized when batched,
+    ///   whose send attempts failed, or still queued or in flight at the
+    ///   shutdown deadline;
+    /// - persistent mode only: rows marked for upload but not yet sent when
+    ///   retention evicted them (`persistence_abandoned`).
+    ///
+    /// In persistent mode a failed send does not drop anything: the batch stays
+    /// in the spool and is retried. Retention evicting a sent or local-only row
+    /// is ordinary history cleanup and is not counted here, although it is in
+    /// `persistence_evicted_*`. A `ReportResult::NotStored` log is not counted
+    /// either: the caller asked not to upload it.
     pub dropped: u64,
     /// Logs currently waiting in the bounded in-memory or persistence command
     /// queue. Persistent rows already committed to SQLite are reported by
@@ -173,13 +201,21 @@ pub struct ReporterStatsSnapshot {
     #[cfg(feature = "persist")]
     pub persistence_recovered_rows: u64,
     /// Rows currently stored in the persistent spool, including sent and
-    /// local-only rows kept as local history.
+    /// local-only rows kept as local history. For the upload backlog see
+    /// `persistence_unsent_rows`.
     #[cfg(feature = "persist")]
     pub persistence_pending_rows: u64,
     /// Serialized event bytes currently stored in the persistent spool,
     /// including sent and local-only rows.
     #[cfg(feature = "persist")]
     pub persistence_pending_bytes: u64,
+    /// Rows currently in the persistent spool that are marked for upload and
+    /// have not been acknowledged by SLS: the upload backlog, including the
+    /// batch currently assigned for upload. Sent and local-only rows are not
+    /// counted. It rises by one per committed upload row and falls when SLS
+    /// acknowledges a batch or retention abandons an unsent row.
+    #[cfg(feature = "persist")]
+    pub persistence_unsent_rows: u64,
     /// Recovered logs delivered from a batch assigned before this process.
     #[cfg(feature = "persist")]
     pub persistence_replayed: u64,
@@ -250,6 +286,8 @@ pub(crate) struct Stats {
     pub(crate) persistence_pending_rows: AtomicU64,
     #[cfg(feature = "persist")]
     pub(crate) persistence_pending_bytes: AtomicU64,
+    #[cfg(feature = "persist")]
+    pub(crate) persistence_unsent_rows: AtomicU64,
     #[cfg(feature = "persist")]
     pub(crate) persistence_replayed: AtomicU64,
     #[cfg(feature = "persist")]
@@ -1395,6 +1433,8 @@ impl State {
             #[cfg(feature = "persist")]
             persistence_pending_bytes: self.stats.persistence_pending_bytes.load(Ordering::Relaxed),
             #[cfg(feature = "persist")]
+            persistence_unsent_rows: self.stats.persistence_unsent_rows.load(Ordering::Relaxed),
+            #[cfg(feature = "persist")]
             persistence_replayed: self.stats.persistence_replayed.load(Ordering::Relaxed),
             #[cfg(feature = "persist")]
             persistence_failed_cycles: self.stats.persistence_failed_cycles.load(Ordering::Relaxed),
@@ -2296,6 +2336,129 @@ mod tests {
             "restart resends with the seqid and spool key SLS already received"
         );
         assert_eq!(calls[0].2, 1);
+        let _ = std::fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    /// Commit one row, then round-trip a `NextBatch` command through the
+    /// writer. The writer handles commands in order, so when this returns it
+    /// has finished the commit group, including its wake decision.
+    #[cfg(feature = "persist")]
+    async fn commit_and_settle(
+        persistence: &PersistenceSender,
+        state: &State,
+        index: u32,
+        upload: bool,
+    ) {
+        let (metadata, log) = item(index);
+        assert!(persistence.commit(metadata, log, upload, state).is_ok());
+        let _ = persistence
+            .next_batch(usize::MAX, usize::MAX, false)
+            .await
+            .expect("writer is running");
+    }
+
+    #[cfg(feature = "persist")]
+    #[tokio::test]
+    async fn local_only_commit_does_not_wake_uploader() {
+        let path = persistence_test_path("local-only-no-wake");
+        let state = Arc::new(State::default());
+        let persistence = start_spool(&path, state.clone());
+
+        commit_and_settle(&persistence, &state, 1, false).await;
+        commit_and_settle(&persistence, &state, 2, false).await;
+
+        assert!(
+            !persistence.take_wake(),
+            "local-only rows can never form a batch, so they must not wake the uploader"
+        );
+        drop(persistence);
+        let _ = std::fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    #[cfg(feature = "persist")]
+    #[tokio::test]
+    async fn waiting_uploader_is_woken_by_upload_row_only() {
+        let path = persistence_test_path("upload-wakes");
+        let state = Arc::new(State::default());
+        let persistence = start_spool(&path, state.clone());
+        let (_stop, shutdown) = async_channel::bounded::<()>(1);
+        let config = ReporterConfig::default()
+            .with_linger(Duration::from_millis(10))
+            .with_linger_jitter_percent(0);
+        // The spool is empty, so the uploader's first look finds nothing and
+        // it waits for a wake-up; without one it would wait forever, which
+        // the timeout below turns into a failure.
+        let waiting = tokio::spawn({
+            let persistence = persistence.clone();
+            async move {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    next_persistent_batch(&persistence, &config, &shutdown),
+                )
+                .await
+            }
+        });
+
+        commit_and_settle(&persistence, &state, 1, false).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        commit_and_settle(&persistence, &state, 2, true).await;
+
+        let batch = waiting
+            .await
+            .expect("uploader task")
+            .expect("upload row wakes the waiting uploader")
+            .expect("next batch")
+            .expect("a local-only wake-up would have returned no batch");
+        assert_eq!(batch.logs, vec![item(2).1], "only the upload row is sent");
+        drop(persistence);
+        let _ = std::fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    #[cfg(feature = "persist")]
+    #[tokio::test]
+    async fn unsent_rows_count_upload_backlog_until_acknowledged() {
+        let path = persistence_test_path("unsent-rows");
+        let state = Arc::new(State::default());
+        let persistence = start_spool(&path, state.clone());
+        for (index, upload) in [(1, true), (2, false), (3, true)] {
+            let (metadata, log) = item(index);
+            assert!(persistence.commit(metadata, log, upload, &state).is_ok());
+        }
+        assert_eq!(state.snapshot().persistence_unsent_rows, 2);
+
+        let batch = persistence
+            .next_batch(1, usize::MAX, true)
+            .await
+            .expect("next batch")
+            .expect("one upload row");
+        assert_eq!(
+            state.snapshot().persistence_unsent_rows,
+            2,
+            "an assigned batch is still unsent"
+        );
+        let sink = RecordingSink::default();
+        assert!(persistent_send_cycle(&sink, &batch, &ReporterConfig::default(), &state).await);
+        finish_persistent_cycle(&persistence, &batch, true, &state).await;
+
+        // 3 written, 2 marked for upload, 1 sent: 2 - 1 = 1.
+        assert_eq!(state.snapshot().persistence_unsent_rows, 1);
+        assert_eq!(state.snapshot().persistence_pending_rows, 3);
+        let connection = rusqlite::Connection::open(&path).expect("open spool");
+        let unsent: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pending_events WHERE upload = 1 AND sent = 0",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count unsent rows");
+        assert_eq!(unsent, 1, "the gauge matches the spool");
+        drop(connection);
+        drop(persistence);
+
+        let reopened = Arc::new(State::default());
+        let persistence = start_spool(&path, reopened.clone());
+        assert_eq!(reopened.snapshot().persistence_unsent_rows, 1);
+        drop(persistence);
         let _ = std::fs::remove_dir_all(path.parent().expect("temporary parent"));
     }
 

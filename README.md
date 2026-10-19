@@ -199,8 +199,14 @@ tracing_subscriber::registry().with(layer).init();
 
 The callback runs inside `on_event`, on the thread that emitted the event,
 after the event is formatted and before the row is committed. It may add fields
-to `log`. It must not perform network I/O, sleep, block, emit `tracing` events,
-or panic. Synthesized span lifecycle events have no `Event` and are always
+to `log`. It must not perform network I/O, sleep, block, or emit `tracing`
+events. If it panics, the panic does not reach the code that emitted the event:
+the Layer catches it and marks that event for upload, as if no decision were
+installed (with `panic = "abort"` the process aborts instead). State shared
+across events stays as the panic left it, so a `Mutex` the callback holds while
+panicking is poisoned; take it with `lock().unwrap_or_else(|e| e.into_inner())`
+rather than `lock().unwrap()`, which would panic, and so upload, on every later
+event. Synthesized span lifecycle events have no `Event` and are always
 marked for upload. The reporter-level equivalents are
 `Reporter::try_report_with_upload` and `Reporter::report_with_upload`. A
 local-only event given to a reporter without a persistent spool is discarded
@@ -209,7 +215,12 @@ and `try_report_with_upload` returns `ReportResult::NotStored`.
 `Reporter::stats()` exposes persistent committed/failed admission, current
 stored rows/serialized bytes (including sent and local-only rows),
 count/age/storage evictions and evicted bytes, abandoned uploads, recovered
-unsent rows, replayed rows, and failed durable upload cycles. Counters reset on
+unsent rows, the current upload backlog (`persistence_unsent_rows`: rows marked
+for upload and not yet acknowledged), replayed rows, and failed durable upload
+cycles. `received` counts every admission call; each call is accepted, rejected
+(counted in `dropped`), or `NotStored` (counted in neither), so `received` is
+not `accepted + dropped`. In persistent mode `dropped` also counts abandoned
+uploads, but not retention of sent or local-only rows. Counters reset on
 restart. Stored payloads include log contents plus topic, source, and tags, so
 the spool may contain credentials, tokens, personal data, or other sensitive
 fields recorded by the application.
