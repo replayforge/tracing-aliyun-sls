@@ -56,6 +56,16 @@ fn persistent_child_entry() {
     let metadata = Arc::new(LogGroupMetadata::new().with_topic("crash-test"));
     let log = Log::new(1, None).with(MayStaticKey::from_static("message"), "survives kill");
     assert_eq!(reporter.try_report(metadata, log), ReportResult::Accepted);
+    // `Accepted` only means queued for the writer thread; report readiness
+    // once the row is committed, since the parent kills this process next.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while reporter.stats().persistence_committed == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "row was not committed"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     println!("{CHILD_READY}");
     std::io::stdout().flush().expect("flush child readiness");
     std::thread::park();

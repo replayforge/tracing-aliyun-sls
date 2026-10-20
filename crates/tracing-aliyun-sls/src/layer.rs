@@ -263,8 +263,9 @@ impl<S, FT, T, E> Layer<S, FT, T, E> {
     /// that is never uploaded. `decide` may add fields to `log`, for example a
     /// count of earlier events it chose not to upload.
     ///
-    /// Without a persistent spool (a reporter not built with
-    /// `build_with_persistence`) a local-only log is discarded.
+    /// Without a persistent spool (a reporter built neither with
+    /// `build_with_persistence` nor `Reporter::local_only`) a local-only log is
+    /// discarded.
     ///
     /// `decide` runs on the thread that emitted the event, so it inherits the
     /// `on_event` constraints: it must not perform network I/O, sleep, block

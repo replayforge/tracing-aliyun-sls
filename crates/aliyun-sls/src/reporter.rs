@@ -91,19 +91,23 @@ pub struct ReporterBuilder {
 /// Result of attempting to admit one log.
 ///
 /// Without persistent mode, admission means enqueueing in memory. With a
-/// reporter built by [`ReporterBuilder::build_with_persistence`], `Accepted`
-/// means the SQLite transaction committed before the call returned.
+/// reporter built by [`ReporterBuilder::build_with_persistence`] or
+/// [`Reporter::local_only`], `Accepted` means the log was handed to the SQLite
+/// writer thread; the commit happens afterwards and its outcome is counted in
+/// `persistence_committed` or `persistence_write_failed`. A log accepted just
+/// before the process dies may therefore not be on disk.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ReportResult {
-    /// The log was accepted into memory or committed to the persistent spool.
+    /// The log was accepted into memory or queued for the persistent spool.
     Accepted,
     /// The bounded queue had no available capacity.
     Full,
     /// The reporter has stopped accepting logs.
     Closed,
-    /// The persistence command queue was full or closed, the event exceeded a
-    /// configured limit, or SQLite failed before commit.
+    /// The persistence command queue was full or closed, or the event exceeded
+    /// the configured maximum batch size. SQLite failures happen after
+    /// admission and are counted in `persistence_write_failed` instead.
     #[cfg(feature = "persist")]
     PersistenceFailed,
     /// The caller marked the log local-only, but this reporter has no
@@ -123,8 +127,8 @@ pub struct ReporterStatsSnapshot {
     /// ends in exactly one of three ways:
     ///
     /// - accepted: counted in `accepted`;
-    /// - rejected at admission (full, closed, oversized in persistent mode,
-    ///   or a persistence failure): counted in `dropped`;
+    /// - rejected at admission (full, closed, or oversized in persistent
+    ///   mode): counted in `dropped`;
     /// - `ReportResult::NotStored` (a local-only log without a persistent
     ///   spool): counted in neither.
     ///
@@ -133,10 +137,14 @@ pub struct ReporterStatsSnapshot {
     /// `accepted + dropped`: `dropped` also counts accepted logs that were lost
     /// later (see `dropped`).
     pub received: u64,
-    /// Logs accepted into the in-memory queue or committed to the persistent
-    /// spool.
+    /// Logs accepted into the in-memory queue or into the persistence command
+    /// queue. In persistent mode this is counted before the SQLite write; see
+    /// `persistence_committed` and `persistence_write_failed` for its outcome.
     pub accepted: u64,
-    /// Logs rejected because the queue was full.
+    /// Logs rejected because the queue was full. In persistent mode this is the
+    /// bounded queue in front of the SQLite writer thread, which fills while
+    /// the writer is slow or waiting for a lock: these logs were neither
+    /// stored nor uploaded.
     pub queue_full: u64,
     /// Logs rejected because the reporter was closed.
     pub queue_closed: u64,
@@ -158,8 +166,9 @@ pub struct ReporterStatsSnapshot {
     /// - in-memory mode only: accepted but then found oversized when batched,
     ///   whose send attempts failed, or still queued or in flight at the
     ///   shutdown deadline;
-    /// - persistent mode only: rows marked for upload but not yet sent when
-    ///   retention evicted them (`persistence_abandoned`).
+    /// - persistent mode only: accepted logs the writer could not store
+    ///   (`persistence_write_failed`), and rows marked for upload but not yet
+    ///   sent when retention evicted them (`persistence_abandoned`).
     ///
     /// In persistent mode a failed send does not drop anything: the batch stays
     /// in the spool and is retried. Retention evicting a sent or local-only row
@@ -171,12 +180,22 @@ pub struct ReporterStatsSnapshot {
     /// queue. Persistent rows already committed to SQLite are reported by
     /// `persistence_pending_rows`.
     pub queue_depth: u64,
-    /// Logs durably committed to the persistent spool.
+    /// Logs the writer thread committed to the persistent spool.
     #[cfg(feature = "persist")]
     pub persistence_committed: u64,
-    /// Logs rejected because persistent admission or SQLite failed.
+    /// Logs lost on the way to the persistent spool: rejected at admission
+    /// (queue full or closed, oversized) or accepted and then not written
+    /// (`persistence_write_failed`).
     #[cfg(feature = "persist")]
     pub persistence_failed: u64,
+    /// Accepted logs the writer thread could not store: the SQLite transaction
+    /// failed (disk full, a lock held by another connection longer than
+    /// [`PersistenceConfig::busy_timeout`], a damaged file) or the event did
+    /// not fit the storage budget. The caller already got `Accepted`, so this
+    /// counter is the only signal; it is also counted in `persistence_failed`
+    /// and `dropped`.
+    #[cfg(feature = "persist")]
+    pub persistence_write_failed: u64,
     /// Rows evicted by the configured maximum event count. Like the other
     /// `persistence_evicted_*` counters this includes sent and local-only rows;
     /// see `persistence_abandoned` for evicted rows that were never uploaded.
@@ -232,7 +251,9 @@ pub struct Reporter {
     #[cfg(feature = "persist")]
     persistence: Option<Arc<PersistenceSender>>,
     consumer: Arc<Mutex<Option<Consumer>>>,
-    client: SlsClient,
+    /// `None` only for [`Reporter::local_only`], which always has a
+    /// persistent spool.
+    client: Option<SlsClient>,
     config: ReporterConfig,
 }
 
@@ -241,7 +262,7 @@ pub struct Reporting {
     state: Arc<State>,
     producer: Arc<Producer>,
     consumer: Consumer,
-    client: SlsClient,
+    client: Option<SlsClient>,
     config: ReporterConfig,
     #[cfg(feature = "persist")]
     persistence: Option<Arc<PersistenceSender>>,
@@ -270,6 +291,8 @@ pub(crate) struct Stats {
     pub(crate) persistence_committed: AtomicU64,
     #[cfg(feature = "persist")]
     pub(crate) persistence_failed: AtomicU64,
+    #[cfg(feature = "persist")]
+    pub(crate) persistence_write_failed: AtomicU64,
     #[cfg(feature = "persist")]
     pub(crate) persistence_evicted_count: AtomicU64,
     #[cfg(feature = "persist")]
@@ -521,17 +544,22 @@ impl ReporterBuilder {
             #[cfg(feature = "persist")]
             persistence: None,
             consumer: Arc::new(Mutex::new(Some(consumer))),
-            client: self.client,
+            client: Some(self.client),
             config: self.config,
         }
     }
 
-    /// Build a reporter whose successful admission is committed to SQLite.
+    /// Build a reporter that stores every admitted log in SQLite.
     ///
     /// This is the runtime opt-in required in addition to Cargo feature
     /// `persist`. The method starts one dedicated SQLite writer thread and
     /// validates that an existing spool belongs to this client's endpoint,
-    /// project, and logstore.
+    /// project, and logstore. A spool created by [`Reporter::local_only`]
+    /// is not bound to a destination yet; this binds it to this client and
+    /// uploads its rows marked for upload.
+    ///
+    /// Admission only hands the log to the writer thread and never waits for
+    /// the SQLite commit (see [`ReportResult`]).
     ///
     /// SQLite uses WAL mode, `synchronous=NORMAL`, and `auto_vacuum=NONE`.
     /// `NORMAL` protects committed rows from ordinary process termination, but
@@ -549,23 +577,7 @@ impl ReporterBuilder {
         self,
         persistence_config: PersistenceConfig,
     ) -> Result<Reporter, PersistenceError> {
-        let (producer, consumer) = async_channel::bounded(self.config.queue_capacity.max(1));
-        let state = Arc::new(State::default());
-        let destination_fingerprint = self.client.persistence_destination_fingerprint();
-        let persistence = PersistenceSender::start(
-            persistence_config,
-            self.config.queue_capacity,
-            destination_fingerprint,
-            state.clone(),
-        )?;
-        Ok(Reporter {
-            state,
-            producer: Arc::new(producer),
-            persistence: Some(persistence),
-            consumer: Arc::new(Mutex::new(Some(consumer))),
-            client: self.client,
-            config: self.config,
-        })
+        Reporter::start_persistent(Some(self.client), self.config, persistence_config)
     }
 }
 
@@ -578,6 +590,60 @@ impl Reporter {
     /// Create a new reporter with the given SLS client.
     pub fn from_client(client: SlsClient) -> Self {
         ReporterBuilder::new(client).build()
+    }
+
+    /// Build a reporter that only keeps a local SQLite history, without an
+    /// SLS client.
+    ///
+    /// Admission behaves as with [`ReporterBuilder::build_with_persistence`]
+    /// and the `upload` flag is stored per row, but nothing is ever sent: no
+    /// HTTP client exists. Run [`Reporter::reporting_default`] with a graceful
+    /// shutdown as usual; in this mode it only drains the writer queue at
+    /// shutdown. Of `config`, the queue capacity, maximum batch size (the
+    /// admission size limit), and shutdown timeout apply.
+    ///
+    /// A new spool is not bound to a destination. When the application later
+    /// starts with an SLS client on the same spool, that client binds it and
+    /// uploads the rows that were marked for upload and are still retained.
+    /// An existing spool bound to a destination is accepted as is.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`ReporterBuilder::build_with_persistence`], except that
+    /// there is no destination to mismatch.
+    #[cfg(feature = "persist")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "persist")))]
+    pub fn local_only(
+        config: ReporterConfig,
+        persistence_config: PersistenceConfig,
+    ) -> Result<Self, PersistenceError> {
+        Self::start_persistent(None, config, persistence_config)
+    }
+
+    #[cfg(feature = "persist")]
+    fn start_persistent(
+        client: Option<SlsClient>,
+        config: ReporterConfig,
+        persistence_config: PersistenceConfig,
+    ) -> Result<Self, PersistenceError> {
+        let (producer, consumer) = async_channel::bounded(config.queue_capacity.max(1));
+        let state = Arc::new(State::default());
+        let persistence = PersistenceSender::start(
+            persistence_config,
+            config.queue_capacity,
+            client
+                .as_ref()
+                .map(SlsClient::persistence_destination_fingerprint),
+            state.clone(),
+        )?;
+        Ok(Self {
+            state,
+            producer: Arc::new(producer),
+            persistence: Some(persistence),
+            consumer: Arc::new(Mutex::new(Some(consumer))),
+            client,
+            config,
+        })
     }
 
     /// Create the reporting future with a given drain timer.
@@ -632,11 +698,12 @@ impl Reporter {
 
     /// Attempt to admit a log.
     ///
-    /// In memory-only mode this is a nonblocking bounded-channel `try_send`.
-    /// In persistent mode it never waits for network delivery or queue
-    /// capacity, but it synchronously waits for the dedicated writer to commit
-    /// the SQLite transaction. Queue or SQLite errors immediately return
-    /// [`ReportResult::PersistenceFailed`].
+    /// This never blocks: in both modes it is a nonblocking bounded-channel
+    /// `try_send`. In persistent mode the channel feeds the dedicated SQLite
+    /// writer thread, and this call does not wait for the commit, a SQLite
+    /// lock, or the network. A full or closed queue, or an event larger than
+    /// the maximum batch size, returns [`ReportResult::PersistenceFailed`];
+    /// a SQLite failure afterwards is only counted (`persistence_write_failed`).
     ///
     /// The log is marked for upload; this is the same as
     /// [`Reporter::try_report_with_upload`] with `upload = true`.
@@ -686,7 +753,7 @@ impl Reporter {
     /// `upload = true` behaves exactly like [`Reporter::try_report`].
     ///
     /// `upload = false` stores the log in the persistent spool as local
-    /// history only: it is committed like any other row and removed by the
+    /// history only: it is written like any other row and removed by the
     /// configured retention, but it is never assigned to an upload batch. On a
     /// reporter without a persistent spool there is nowhere to keep such a log,
     /// so it is discarded and [`ReportResult::NotStored`] is returned.
@@ -743,13 +810,9 @@ impl Reporter {
             self.state.stats.dropped.fetch_add(1, Ordering::Relaxed);
             return ReportResult::PersistenceFailed;
         }
-        match persistence.commit(metadata, log, upload, &self.state) {
+        match persistence.enqueue(metadata, log, upload, &self.state) {
             Ok(()) => {
                 self.state.stats.accepted.fetch_add(1, Ordering::Relaxed);
-                self.state
-                    .stats
-                    .persistence_committed
-                    .fetch_add(1, Ordering::Relaxed);
                 ReportResult::Accepted
             }
             Err(failure) => {
@@ -763,7 +826,6 @@ impl Reporter {
                             .queue_closed
                             .fetch_add(1, Ordering::Relaxed);
                     }
-                    AdmissionFailure::Store => {}
                 }
                 self.state
                     .stats
@@ -777,7 +839,8 @@ impl Reporter {
 
     /// Return a point-in-time snapshot of process-local reporter counters.
     ///
-    /// Persistent snapshots include committed/failed admission, retention
+    /// Persistent snapshots include committed rows, failed admission and
+    /// writes, retention
     /// evictions and bytes, recovered/replayed rows, current pending rows and
     /// serialized bytes, and upload cycles that left a batch durable.
     pub fn stats(&self) -> ReporterStatsSnapshot {
@@ -838,8 +901,21 @@ impl Reporting {
 
         #[cfg(feature = "persist")]
         if let Some(persistence) = persistence {
-            let work_fut =
-                persistent_worker(persistence, client, config, state.clone(), shutdown_rx);
+            let worker_state = state.clone();
+            let work_fut = async move {
+                match client {
+                    Some(client) => {
+                        persistent_worker(persistence, client, config, worker_state, shutdown_rx)
+                            .await;
+                    }
+                    // Local-only: nothing to upload, so only wait for the
+                    // shutdown and then drain the writer queue.
+                    None => {
+                        let _ = shutdown_rx.recv().await;
+                        persistent_graceful_shutdown(persistence, None, config, worker_state).await;
+                    }
+                }
+            };
             let shutdown_fut = async move {
                 shutdown_signal.await;
                 state.begin_close();
@@ -850,6 +926,11 @@ impl Reporting {
             return;
         }
 
+        // Only `Reporter::local_only` has no client, and it always has a
+        // persistent spool, so the memory-only path always has one.
+        let Some(client) = client else {
+            return;
+        };
         let mut vec_pool = Vec::with_capacity(vec_pool_capacity);
         vec_pool.resize_with(vec_pool_capacity, || Vec::with_capacity(log_vec_capacity));
         let mut worker = BatchWorker {
@@ -941,7 +1022,7 @@ async fn persistent_worker(
             futures_util::future::Either::Right(_) => break,
         }
     }
-    persistent_graceful_shutdown(persistence, client, config, state).await;
+    persistent_graceful_shutdown(persistence, Some(client), config, state).await;
 }
 
 #[cfg(feature = "persist")]
@@ -1075,12 +1156,24 @@ async fn finish_persistent_cycle(
 #[cfg(feature = "persist")]
 async fn persistent_graceful_shutdown(
     persistence: Arc<PersistenceSender>,
-    client: SlsClient,
+    client: Option<SlsClient>,
     config: ReporterConfig,
     state: Arc<State>,
 ) {
     let deadline = sleep(config.shutdown_timeout).fuse();
     futures_util::pin_mut!(deadline);
+    // Drain the writer queue first, so logs admitted before shutdown are on
+    // disk and can be part of the final batches. The same deadline bounds it:
+    // a writer stuck on a SQLite lock cannot hold up shutdown.
+    let flush = persistence.flush().fuse();
+    futures_util::pin_mut!(flush);
+    select! {
+        _ = flush => {},
+        _ = deadline => return,
+    }
+    let Some(client) = client else {
+        return;
+    };
     loop {
         let next = persistence
             .next_batch(config.batch_max_count, config.batch_max_bytes, true)
@@ -1392,7 +1485,7 @@ impl State {
         self.is_closing.store(true, Ordering::Release);
     }
 
-    fn snapshot(&self) -> ReporterStatsSnapshot {
+    pub(crate) fn snapshot(&self) -> ReporterStatsSnapshot {
         ReporterStatsSnapshot {
             received: self.stats.received.load(Ordering::Relaxed),
             accepted: self.stats.accepted.load(Ordering::Relaxed),
@@ -1410,6 +1503,8 @@ impl State {
             persistence_committed: self.stats.persistence_committed.load(Ordering::Relaxed),
             #[cfg(feature = "persist")]
             persistence_failed: self.stats.persistence_failed.load(Ordering::Relaxed),
+            #[cfg(feature = "persist")]
+            persistence_write_failed: self.stats.persistence_write_failed.load(Ordering::Relaxed),
             #[cfg(feature = "persist")]
             persistence_evicted_count: self.stats.persistence_evicted_count.load(Ordering::Relaxed),
             #[cfg(feature = "persist")]
@@ -1913,9 +2008,21 @@ mod tests {
             .join("spool.sqlite3")
     }
 
+    /// Wait until the writer handled every log admitted so far.
     #[cfg(feature = "persist")]
-    #[test]
-    fn persistent_acceptance_acknowledges_a_visible_commit() {
+    async fn settle(reporter: &Reporter) {
+        reporter
+            .persistence
+            .as_ref()
+            .expect("persistent reporter")
+            .flush()
+            .await
+            .expect("writer is running");
+    }
+
+    #[cfg(feature = "persist")]
+    #[tokio::test]
+    async fn persistent_acceptance_is_committed_by_the_writer() {
         let path = persistence_test_path("commit");
         let reporter = Reporter::builder(client())
             .with_queue_capacity(2)
@@ -1924,6 +2031,7 @@ mod tests {
         let (metadata, log) = item(1);
 
         assert_eq!(reporter.try_report(metadata, log), ReportResult::Accepted);
+        settle(&reporter).await;
 
         let connection = rusqlite::Connection::open(&path).expect("open committed spool");
         let rows: i64 = connection
@@ -1945,8 +2053,8 @@ mod tests {
     }
 
     #[cfg(feature = "persist")]
-    #[test]
-    fn persistent_storage_eviction_updates_drop_counters() {
+    #[tokio::test]
+    async fn persistent_storage_eviction_updates_drop_counters() {
         let path = persistence_test_path("storage-eviction");
         let reporter = Reporter::builder(client())
             .build_with_persistence(PersistenceConfig::new(128 * 1024).path(path.clone()))
@@ -1957,6 +2065,7 @@ mod tests {
                 .with(MayStaticKey::from_static("message"), "x".repeat(70 * 1024));
             assert_eq!(reporter.try_report(metadata, log), ReportResult::Accepted);
         }
+        settle(&reporter).await;
 
         let stats = reporter.stats();
         assert_eq!(stats.persistence_committed, 2);
@@ -1967,9 +2076,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().expect("temporary parent"));
     }
 
+    /// A row the writer cannot store (here: larger than the storage budget)
+    /// is not reported to the caller, who already got `Accepted`; it is
+    /// counted once in the write-failure, failure, and drop counters.
     #[cfg(feature = "persist")]
-    #[test]
-    fn persistent_store_error_is_reported_without_retry() {
+    #[tokio::test]
+    async fn persistent_write_failure_is_counted_not_returned() {
         let path = persistence_test_path("error");
         let reporter = Reporter::builder(client())
             .build_with_persistence(PersistenceConfig::new(128 * 1024).path(path.clone()))
@@ -1978,12 +2090,12 @@ mod tests {
         let log =
             Log::new(1, None).with(MayStaticKey::from_static("message"), "x".repeat(100 * 1024));
 
-        assert_eq!(
-            reporter.try_report(metadata, log),
-            ReportResult::PersistenceFailed
-        );
+        assert_eq!(reporter.try_report(metadata, log), ReportResult::Accepted);
+        settle(&reporter).await;
         let stats = reporter.stats();
-        assert_eq!(stats.accepted, 0);
+        assert_eq!(stats.accepted, 1);
+        assert_eq!(stats.persistence_committed, 0);
+        assert_eq!(stats.persistence_write_failed, 1);
         assert_eq!(stats.persistence_failed, 1);
         assert_eq!(stats.dropped, 1);
         assert_eq!(stats.persistence_pending_rows, 0);
@@ -2031,6 +2143,7 @@ mod tests {
             .expect("build persistent reporter");
         let (metadata, log) = item(1);
         assert_eq!(reporter.try_report(metadata, log), ReportResult::Accepted);
+        settle(&reporter).await;
         let reporting = reporter
             .reporting_default()
             .await
@@ -2082,14 +2195,14 @@ mod tests {
         let persistence = PersistenceSender::start(
             PersistenceConfig::new(1024 * 1024).path(path.clone()),
             2,
-            b"fake-persistent-sink".to_vec().into_boxed_slice(),
+            Some(b"fake-persistent-sink".to_vec().into_boxed_slice()),
             state.clone(),
         )
         .expect("start persistence");
         let (metadata, log) = item(1);
         assert!(
-            persistence.commit(metadata, log, true, &state).is_ok(),
-            "commit event"
+            persistence.enqueue(metadata, log, true, &state).is_ok(),
+            "queue event"
         );
         let batch = persistence
             .next_batch(1, usize::MAX, true)
@@ -2123,8 +2236,8 @@ mod tests {
     }
 
     #[cfg(feature = "persist")]
-    #[test]
-    fn upload_flag_is_stored_per_row_and_local_only_needs_a_spool() {
+    #[tokio::test]
+    async fn upload_flag_is_stored_per_row_and_local_only_needs_a_spool() {
         let path = persistence_test_path("upload-flag");
         let reporter = Reporter::builder(client())
             .build_with_persistence(PersistenceConfig::new(1024 * 1024).path(path.clone()))
@@ -2137,6 +2250,7 @@ mod tests {
             };
             assert_eq!(result, ReportResult::Accepted);
         }
+        settle(&reporter).await;
         let connection = rusqlite::Connection::open(&path).expect("open spool");
         let flags = connection
             .prepare("SELECT upload FROM pending_events ORDER BY id")
@@ -2201,7 +2315,7 @@ mod tests {
         PersistenceSender::start(
             PersistenceConfig::new(1024 * 1024).path(path.to_path_buf()),
             8,
-            b"crash-destination".to_vec().into_boxed_slice(),
+            Some(b"crash-destination".to_vec().into_boxed_slice()),
             state,
         )
         .expect("start persistence")
@@ -2220,9 +2334,13 @@ mod tests {
         let state = Arc::new(State::default());
         let persistence = start_spool(std::path::Path::new(path), state.clone());
         let (metadata, log) = item(1);
-        assert!(persistence.commit(metadata, log, true, &state).is_ok());
+        assert!(persistence.enqueue(metadata, log, true, &state).is_ok());
         let (metadata, log) = item(2);
-        assert!(persistence.commit(metadata, log, false, &state).is_ok());
+        assert!(persistence.enqueue(metadata, log, false, &state).is_ok());
+        // Writes are asynchronous: report readiness only once both rows are
+        // on disk, since the parent kills this process right after.
+        persistence.flush().await.expect("writer is running");
+        assert_eq!(state.snapshot().persistence_committed, 2);
         if mode == "remote-ack" {
             let batch = persistence
                 .next_batch(10, usize::MAX, true)
@@ -2339,7 +2457,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().expect("temporary parent"));
     }
 
-    /// Commit one row, then round-trip a `NextBatch` command through the
+    /// Queue one row, then round-trip a `NextBatch` command through the
     /// writer. The writer handles commands in order, so when this returns it
     /// has finished the commit group, including its wake decision.
     #[cfg(feature = "persist")]
@@ -2350,7 +2468,7 @@ mod tests {
         upload: bool,
     ) {
         let (metadata, log) = item(index);
-        assert!(persistence.commit(metadata, log, upload, state).is_ok());
+        assert!(persistence.enqueue(metadata, log, upload, state).is_ok());
         let _ = persistence
             .next_batch(usize::MAX, usize::MAX, false)
             .await
@@ -2422,8 +2540,9 @@ mod tests {
         let persistence = start_spool(&path, state.clone());
         for (index, upload) in [(1, true), (2, false), (3, true)] {
             let (metadata, log) = item(index);
-            assert!(persistence.commit(metadata, log, upload, &state).is_ok());
+            assert!(persistence.enqueue(metadata, log, upload, &state).is_ok());
         }
+        persistence.flush().await.expect("writer is running");
         assert_eq!(state.snapshot().persistence_unsent_rows, 2);
 
         let batch = persistence
@@ -2459,6 +2578,319 @@ mod tests {
         let persistence = start_spool(&path, reopened.clone());
         assert_eq!(reopened.snapshot().persistence_unsent_rows, 1);
         drop(persistence);
+        let _ = std::fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    /// Hold the SQLite write lock from another connection, the way a
+    /// `sqlite3` shell running `BEGIN EXCLUSIVE` on the spool would.
+    #[cfg(feature = "persist")]
+    fn lock_spool(path: &std::path::Path) -> rusqlite::Connection {
+        let connection = rusqlite::Connection::open(path).expect("open locking connection");
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .expect("locker busy timeout");
+        connection
+            .execute_batch("BEGIN EXCLUSIVE")
+            .expect("take exclusive lock");
+        connection
+    }
+
+    #[cfg(feature = "persist")]
+    fn count_rows(path: &std::path::Path) -> i64 {
+        rusqlite::Connection::open(path)
+            .expect("open spool")
+            .query_row("SELECT COUNT(*) FROM pending_events", [], |row| row.get(0))
+            .expect("count rows")
+    }
+
+    /// The caller of `try_report` never waits for SQLite: with the spool
+    /// locked by another connection, 1000 admissions each return at once,
+    /// and the rows are written once the lock is released.
+    #[cfg(feature = "persist")]
+    #[tokio::test]
+    async fn locked_spool_does_not_block_admission_and_rows_follow_unlock() {
+        const CALLS: u32 = 1000;
+        let path = persistence_test_path("locked-admission");
+        // Default busy timeout (5 s): the writer is still waiting for the lock
+        // when it is released below, so no row should fail.
+        let reporter = Reporter::builder(client())
+            .build_with_persistence(PersistenceConfig::new(16 * 1024 * 1024).path(path.clone()))
+            .expect("build persistent reporter");
+        let lock = lock_spool(&path);
+
+        let mut samples = Vec::with_capacity(CALLS as usize);
+        for index in 0..CALLS {
+            let (metadata, log) = item(index);
+            let started = std::time::Instant::now();
+            let result = reporter.try_report(metadata, log);
+            let elapsed = started.elapsed();
+            // Generous against scheduler noise; the old synchronous admission
+            // waited for the 5 s busy timeout here. Checked per call so a
+            // regression fails on the first call instead of after 1000 waits.
+            assert!(
+                elapsed < Duration::from_millis(50),
+                "admission {index} took {elapsed:?}"
+            );
+            assert_eq!(result, ReportResult::Accepted);
+            samples.push(elapsed);
+        }
+        assert_eq!(
+            reporter.stats().persistence_committed,
+            0,
+            "nothing can be written while the lock is held"
+        );
+        lock.execute_batch("COMMIT").expect("release lock");
+        drop(lock);
+        settle(&reporter).await;
+
+        samples.sort();
+        let at = |quantile: f64| samples[((samples.len() - 1) as f64 * quantile) as usize];
+        println!(
+            "locked try_report n={} min={:?} p50={:?} p90={:?} p99={:?} p999={:?} max={:?}",
+            samples.len(),
+            samples[0],
+            at(0.5),
+            at(0.9),
+            at(0.99),
+            at(0.999),
+            samples[samples.len() - 1]
+        );
+        let stats = reporter.stats();
+        assert_eq!(
+            (stats.accepted, stats.persistence_committed),
+            (u64::from(CALLS), u64::from(CALLS))
+        );
+        assert_eq!(stats.persistence_write_failed, 0);
+        assert_eq!(count_rows(&path), i64::from(CALLS));
+        drop(reporter);
+        let _ = std::fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    /// While the writer is stuck, the bounded queue in front of it fills and
+    /// further logs are rejected immediately and counted, never waited on.
+    #[cfg(feature = "persist")]
+    #[tokio::test]
+    async fn full_writer_queue_drops_and_counts() {
+        const CALLS: u32 = 20;
+        let path = persistence_test_path("queue-full");
+        let reporter = Reporter::builder(client())
+            .with_queue_capacity(4)
+            .build_with_persistence(PersistenceConfig::new(1024 * 1024).path(path.clone()))
+            .expect("build persistent reporter");
+        let lock = lock_spool(&path);
+
+        let accepted = (0..CALLS)
+            .filter(|&index| {
+                let (metadata, log) = item(index);
+                match reporter.try_report(metadata, log) {
+                    ReportResult::Accepted => true,
+                    ReportResult::PersistenceFailed => false,
+                    other => panic!("unexpected admission result {other:?}"),
+                }
+            })
+            .count() as u64;
+        // The queue holds 4; the writer may already have taken one more.
+        assert!((4..=5).contains(&accepted), "accepted {accepted}");
+        let rejected = u64::from(CALLS) - accepted;
+        let stats = reporter.stats();
+        assert_eq!(stats.queue_full, rejected);
+        assert_eq!(stats.persistence_failed, rejected);
+        assert_eq!(stats.dropped, rejected);
+        assert_eq!(stats.received, u64::from(CALLS));
+
+        lock.execute_batch("COMMIT").expect("release lock");
+        drop(lock);
+        settle(&reporter).await;
+        assert_eq!(reporter.stats().persistence_committed, accepted);
+        assert_eq!(count_rows(&path), accepted as i64);
+        drop(reporter);
+        let _ = std::fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    /// A lock held longer than `busy_timeout` makes the write fail. The
+    /// callers already got `Accepted`; the rows are counted as write failures
+    /// and the writer keeps serving later rows.
+    #[cfg(feature = "persist")]
+    #[tokio::test]
+    async fn write_failure_under_lock_is_counted_and_writer_recovers() {
+        const CALLS: u32 = 10;
+        let path = persistence_test_path("write-failed");
+        let reporter = Reporter::builder(client())
+            .build_with_persistence(
+                PersistenceConfig::new(1024 * 1024)
+                    .path(path.clone())
+                    .busy_timeout(Duration::from_millis(50)),
+            )
+            .expect("build persistent reporter");
+        let lock = lock_spool(&path);
+        for index in 0..CALLS {
+            let (metadata, log) = item(index);
+            assert_eq!(reporter.try_report(metadata, log), ReportResult::Accepted);
+        }
+        settle(&reporter).await;
+
+        let stats = reporter.stats();
+        assert_eq!(stats.persistence_committed, 0);
+        assert_eq!(stats.persistence_write_failed, u64::from(CALLS));
+        assert_eq!(stats.persistence_failed, u64::from(CALLS));
+        assert_eq!(stats.dropped, u64::from(CALLS));
+        assert_eq!(stats.queue_depth, 0);
+
+        lock.execute_batch("COMMIT").expect("release lock");
+        drop(lock);
+        let (metadata, log) = item(CALLS);
+        assert_eq!(reporter.try_report(metadata, log), ReportResult::Accepted);
+        settle(&reporter).await;
+        assert_eq!(reporter.stats().persistence_committed, 1);
+        assert_eq!(count_rows(&path), 1);
+        drop(reporter);
+        let _ = std::fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    /// Without an SLS client every log is still stored with its upload flag
+    /// and nothing is sent. A later start with a client uploads the rows that
+    /// were marked for upload.
+    #[cfg(feature = "persist")]
+    #[tokio::test]
+    async fn local_only_reporter_stores_without_client_and_later_client_uploads() {
+        let path = persistence_test_path("local-only");
+        let reporter = Reporter::local_only(
+            ReporterConfig::default(),
+            PersistenceConfig::new(1024 * 1024).path(path.clone()),
+        )
+        .expect("build local-only reporter");
+        assert!(reporter.client.is_none(), "no HTTP client exists");
+        for (index, upload) in [(1, None), (2, Some(false)), (3, Some(true))] {
+            let (metadata, log) = item(index);
+            let result = match upload {
+                None => reporter.try_report(metadata, log),
+                Some(upload) => reporter.try_report_with_upload(metadata, log, upload),
+            };
+            assert_eq!(result, ReportResult::Accepted);
+        }
+        let reporting = reporter
+            .reporting_default()
+            .await
+            .expect("reporting handle");
+        reporting.with_graceful_shutdown(async {}).start().await;
+
+        let stats = reporter.stats();
+        assert_eq!(stats.persistence_committed, 3);
+        assert_eq!(
+            (
+                stats.sent,
+                stats.batches_sent,
+                stats.batches_failed,
+                stats.retried
+            ),
+            (0, 0, 0, 0),
+            "no send was attempted"
+        );
+        let flags = rusqlite::Connection::open(&path)
+            .expect("open spool")
+            .prepare("SELECT upload, sent, batch_seq IS NULL FROM pending_events ORDER BY id")
+            .expect("prepare")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("query")
+            .collect::<Result<Vec<(bool, bool, bool)>, _>>()
+            .expect("flags");
+        assert_eq!(
+            flags,
+            vec![
+                (true, false, true),
+                (false, false, true),
+                (true, false, true)
+            ],
+            "upload flag kept, nothing assigned or sent"
+        );
+        drop(reporter);
+
+        let state = Arc::new(State::default());
+        let persistence = start_spool(&path, state.clone());
+        assert_eq!(state.snapshot().persistence_recovered_rows, 2);
+        let batch = persistence
+            .next_batch(10, usize::MAX, false)
+            .await
+            .expect("next batch")
+            .expect("rows stored without a client are due");
+        assert_eq!(batch.logs, vec![item(1).1, item(3).1]);
+        let sink = RecordingSink::default();
+        assert!(persistent_send_cycle(&sink, &batch, &ReporterConfig::default(), &state).await);
+        finish_persistent_cycle(&persistence, &batch, true, &state).await;
+        assert_eq!(state.snapshot().sent, 2);
+        assert_eq!(sink.calls.lock().expect("calls").len(), 1);
+        drop(persistence);
+        let _ = std::fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    /// Graceful shutdown drains the writer queue before it returns, so logs
+    /// admitted before shutdown are on disk even if the writer was behind.
+    #[cfg(feature = "persist")]
+    #[tokio::test]
+    async fn graceful_shutdown_drains_the_writer_queue() {
+        const CALLS: u32 = 100;
+        let path = persistence_test_path("shutdown-drains");
+        let reporter = Reporter::local_only(
+            ReporterConfig::default().with_shutdown_timeout(Duration::from_secs(10)),
+            PersistenceConfig::new(1024 * 1024).path(path.clone()),
+        )
+        .expect("build local-only reporter");
+        let lock = lock_spool(&path);
+        for index in 0..CALLS {
+            let (metadata, log) = item(index);
+            assert_eq!(reporter.try_report(metadata, log), ReportResult::Accepted);
+        }
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            lock.execute_batch("COMMIT").expect("release lock");
+        });
+        let reporting = reporter
+            .reporting_default()
+            .await
+            .expect("reporting handle");
+
+        reporting.with_graceful_shutdown(async {}).start().await;
+
+        assert_eq!(reporter.stats().persistence_committed, u64::from(CALLS));
+        release.join().expect("release thread");
+        drop(reporter);
+        let _ = std::fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    /// The shutdown drain is bounded by the shutdown timeout even while the
+    /// writer waits for a lock far longer than that.
+    #[cfg(feature = "persist")]
+    #[tokio::test]
+    async fn graceful_shutdown_drain_is_bounded_by_the_shutdown_timeout() {
+        let path = persistence_test_path("shutdown-bounded");
+        let reporter = Reporter::builder(client())
+            .with_shutdown_timeout(Duration::from_millis(200))
+            .build_with_persistence(
+                PersistenceConfig::new(1024 * 1024)
+                    .path(path.clone())
+                    .busy_timeout(Duration::from_secs(30)),
+            )
+            .expect("build persistent reporter");
+        let lock = lock_spool(&path);
+        let (metadata, log) = item(1);
+        assert_eq!(reporter.try_report(metadata, log), ReportResult::Accepted);
+        let reporting = reporter
+            .reporting_default()
+            .await
+            .expect("reporting handle");
+
+        let started = std::time::Instant::now();
+        reporting.with_graceful_shutdown(async {}).start().await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "shutdown took {elapsed:?}"
+        );
+        assert_eq!(reporter.stats().persistence_committed, 0);
+        lock.execute_batch("COMMIT").expect("release lock");
+        drop(lock);
+        drop(reporter);
         let _ = std::fs::remove_dir_all(path.parent().expect("temporary parent"));
     }
 

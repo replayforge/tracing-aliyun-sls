@@ -31,7 +31,8 @@
 //! - `persist`: enable `reporter` plus the optional SQLite spool APIs. This
 //!   Cargo feature only makes persistence available; applications must also
 //!   opt in at runtime with
-//!   [`reporter::ReporterBuilder::build_with_persistence`].
+//!   [`reporter::ReporterBuilder::build_with_persistence`], or
+//!   [`reporter::Reporter::local_only`] for a spool without an SLS client.
 //!
 //! ### Inline Optimizations
 //!

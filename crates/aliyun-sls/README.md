@@ -80,10 +80,22 @@ database file is mode `0600` on Unix.
 
 The spool uses WAL, `synchronous=NORMAL`, and `auto_vacuum=NONE`. One dedicated
 thread serializes all SQLite writes and one upload lane preserves sequence
-order. Persistent `try_report` never waits for the network or queue capacity,
-but does synchronously wait for the SQLite commit. A full/closed persistence
-command queue, serialization/limit rejection, or SQLite error immediately
-returns `ReportResult::PersistenceFailed`.
+order. Persistent `try_report` only queues the event for that thread: it never
+waits for the SQLite commit, a lock, the network, or queue capacity. A
+full/closed persistence command queue or an event larger than the maximum
+batch size returns `ReportResult::PersistenceFailed`. Failures in the writer
+(serialization, storage budget, SQLite errors such as a full disk or a lock
+held by another connection beyond `PersistenceConfig::busy_timeout`, default
+5 s) happen after `Accepted` was returned and are counted in
+`persistence_write_failed` (and `persistence_failed`, `dropped`). Events still
+queued when the process crashes are lost; graceful shutdown drains the queue
+within its deadline first.
+
+`Reporter::local_only(config, persistence)` keeps the spool without an SLS
+client: rows are stored with their `upload` flag and never sent. Its reporting
+future only drains the writer queue at shutdown. The spool stays unbound to a
+destination until a client opens it, which binds it and uploads the retained
+`upload = 1` rows.
 
 Each row has a caller-chosen `upload` flag and a `sent` marker.
 `Reporter::try_report` and `report` mark the row for upload (the default, same
@@ -104,8 +116,8 @@ is a conservative target, not an exact byte cap: WAL checkpoint timing,
 filesystem allocation, and an assigned batch can make `.db` + `.wal` + `.shm`
 larger. CPU includes serialization and SQLite work. Memory is bounded by the
 command queue, one decoded upload batch, SQLite cache, and request buffers.
-Admission adds synchronous disk I/O and is therefore not the memory-only
-reporter's nonblocking/no-disk-I/O hot path.
+Admission itself does no disk I/O; the writer thread does it in the
+background.
 
 A spool is bound to its endpoint/project/logstore. Each assigned batch keeps
 the same spool key and monotonic `seqid`; retry deduplication relies on SLS
@@ -115,7 +127,7 @@ happens before local SQLite acknowledgement, restart resends the same batch
 and `seqid`; only the local acknowledgement transaction marks it sent. Graceful
 shutdown drains until its configured deadline.
 
-`Reporter::stats()` includes committed/failed persistent admissions,
+`Reporter::stats()` includes committed rows, failed admissions and writes,
 count/age/storage evictions and evicted bytes, abandoned uploads, recovered
 unsent rows, replayed rows, stored rows/serialized bytes (including sent and
 local-only rows), the upload backlog (`persistence_unsent_rows`), and failed
@@ -126,11 +138,12 @@ tags; do not record secrets or sensitive data without treating the spool as
 sensitive storage.
 
 `NORMAL` provides an ordinary process-crash recovery guarantee for committed
-rows, not a guarantee against power loss, OS crash, disk/controller/filesystem
+rows (not for rows still in the writer queue), not a guarantee against power loss, OS crash, disk/controller/filesystem
 failure, or faulty write caches.
 
 The network-free stress harness declares the required feature, cleans its
-temporary spool, and reports admission latency/throughput, Linux RSS when
+temporary spool, and reports per-attempt admission latency, end-to-end
+throughput until the writer has committed every event, Linux RSS when
 available, pending rows/bytes, evictions/failures, and combined
 `.db`/`.wal`/`.shm` size:
 

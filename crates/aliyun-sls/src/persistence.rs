@@ -21,6 +21,7 @@ const MAX_WAL_AUTOCHECKPOINT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_GROUP_COMMIT_EVENTS: usize = 32;
 const MAX_GROUP_COMMIT_BYTES: usize = 1024 * 1024;
 const EVICTION_CHUNK_ROWS: i64 = 256;
+const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Configuration for the SQLite-backed event spool.
 ///
@@ -34,6 +35,7 @@ pub struct PersistenceConfig {
     pub(crate) path: Option<PathBuf>,
     pub(crate) max_events: Option<u64>,
     pub(crate) max_age: Option<Duration>,
+    pub(crate) busy_timeout: Duration,
 }
 
 /// An error while configuring or operating the persistent event spool.
@@ -84,6 +86,7 @@ impl PersistenceConfig {
             path: None,
             max_events: None,
             max_age: None,
+            busy_timeout: DEFAULT_BUSY_TIMEOUT,
         }
     }
 
@@ -113,6 +116,18 @@ impl PersistenceConfig {
     /// remains until local acknowledgement.
     pub fn max_age(mut self, max_age: Duration) -> Self {
         self.max_age = Some(max_age);
+        self
+    }
+
+    /// How long the writer waits for a SQLite lock held by another connection
+    /// before failing the write. Defaults to 5 seconds.
+    ///
+    /// Only the dedicated writer thread waits; callers of `try_report` never
+    /// do. Rows whose transaction still cannot get the lock are dropped and
+    /// counted in `persistence_write_failed`, while rows queued behind them
+    /// wait in the bounded command queue.
+    pub fn busy_timeout(mut self, busy_timeout: Duration) -> Self {
+        self.busy_timeout = busy_timeout;
         self
     }
 
@@ -170,17 +185,20 @@ pub(crate) struct PersistenceSender {
 pub(crate) enum AdmissionFailure {
     Full,
     Closed,
-    Store,
 }
 
-type InsertAcknowledgement = mpsc::SyncSender<Result<(), PersistenceError>>;
-
 enum Command {
+    /// Fire-and-forget: the caller does not wait for the commit. The writer
+    /// counts the outcome in the reporter statistics instead.
     Insert {
         metadata: Arc<LogGroupMetadata>,
         log: Box<Log>,
         upload: bool,
-        acknowledgement: InsertAcknowledgement,
+    },
+    /// Answered once every command queued before it has been handled. The
+    /// queue is FIFO, so this drains earlier inserts without a separate path.
+    Flush {
+        acknowledgement: async_channel::Sender<()>,
     },
     NextBatch {
         max_count: usize,
@@ -198,7 +216,6 @@ struct PreparedInsert {
     payload: Vec<u8>,
     created_at_ms: i64,
     upload: bool,
-    acknowledgement: InsertAcknowledgement,
 }
 
 pub(crate) struct PersistentBatch {
@@ -250,7 +267,7 @@ impl PersistenceSender {
     pub(crate) fn start(
         config: PersistenceConfig,
         queue_capacity: usize,
-        destination_fingerprint: Box<[u8]>,
+        destination_fingerprint: Option<Box<[u8]>>,
         state: Arc<State>,
     ) -> Result<Arc<Self>, PersistenceError> {
         config.validate()?;
@@ -261,7 +278,8 @@ impl PersistenceSender {
         thread::Builder::new()
             .name("aliyun-sls-sqlite-writer".into())
             .spawn(move || {
-                match Store::open_for_destination(config, &path, &destination_fingerprint) {
+                match Store::open_for_destination(config, &path, destination_fingerprint.as_deref())
+                {
                     Ok(mut store) => {
                         let pending =
                             store
@@ -315,25 +333,26 @@ impl PersistenceSender {
         }))
     }
 
-    pub(crate) fn commit(
+    /// Hand one row to the writer thread without waiting for it.
+    ///
+    /// This only does a nonblocking `try_send` on the bounded command queue:
+    /// it never waits for SQLite, a lock, or queue capacity. Whether the row
+    /// is then committed is counted by the writer (`persistence_committed` or
+    /// `persistence_write_failed`), not reported to the caller.
+    pub(crate) fn enqueue(
         &self,
         metadata: Arc<LogGroupMetadata>,
         log: Log,
         upload: bool,
         state: &State,
     ) -> Result<(), AdmissionFailure> {
-        let (acknowledgement, result) = mpsc::sync_channel(1);
         state.stats.queue_depth.fetch_add(1, Ordering::Relaxed);
         match self.sender.try_send(Command::Insert {
             metadata,
             log: Box::new(log),
             upload,
-            acknowledgement,
         }) {
-            Ok(()) => result
-                .recv()
-                .map_err(|_| AdmissionFailure::Closed)?
-                .map_err(|_| AdmissionFailure::Store),
+            Ok(()) => Ok(()),
             Err(async_channel::TrySendError::Full(_)) => {
                 decrement_queue_depth(state);
                 Err(AdmissionFailure::Full)
@@ -343,6 +362,23 @@ impl PersistenceSender {
                 Err(AdmissionFailure::Closed)
             }
         }
+    }
+
+    /// Wait until every command queued before this call has been handled,
+    /// so every row admitted before it is committed or counted as failed.
+    ///
+    /// This waits for the writer, including a SQLite busy wait, so callers
+    /// that must stay bounded race it against a deadline.
+    pub(crate) async fn flush(&self) -> Result<(), PersistenceError> {
+        let (acknowledgement, result) = async_channel::bounded(1);
+        self.sender
+            .send(Command::Flush { acknowledgement })
+            .await
+            .map_err(|_| PersistenceError::WriterStopped)?;
+        result
+            .recv()
+            .await
+            .map_err(|_| PersistenceError::WriterStopped)
     }
 
     pub(crate) async fn next_batch(
@@ -416,15 +452,14 @@ fn writer_loop(
                 metadata,
                 log,
                 upload,
-                acknowledgement,
             } => {
                 if decrement_first_insert {
                     decrement_queue_depth(state);
                 }
                 let mut commands = Vec::with_capacity(MAX_GROUP_COMMIT_EVENTS);
                 let mut encoded_bytes = 0usize;
-                let mut next = Some((metadata, log, upload, acknowledgement));
-                while let Some((metadata, log, upload, acknowledgement)) = next.take() {
+                let mut next = Some((metadata, log, upload));
+                while let Some((metadata, log, upload)) = next.take() {
                     match encode_persisted_event(&metadata, &log) {
                         Ok(payload)
                             if payload.len() as u64 <= store.config.payload_budget()
@@ -437,25 +472,20 @@ fn writer_loop(
                                 payload,
                                 created_at_ms: now_millis(),
                                 upload,
-                                acknowledgement,
                             });
                         }
                         Ok(payload) if payload.len() as u64 > store.config.payload_budget() => {
-                            let _ = acknowledgement.send(Err(PersistenceError::EventTooLarge));
+                            record_write_failures(state, 1);
                         }
                         Ok(_) => {
                             pending = Some(Command::Insert {
                                 metadata,
                                 log,
                                 upload,
-                                acknowledgement,
                             });
                             break;
                         }
-                        Err(error) => {
-                            let _ =
-                                acknowledgement.send(Err(PersistenceError::Serialization(error)));
-                        }
+                        Err(_) => record_write_failures(state, 1),
                     }
                     if commands.len() >= MAX_GROUP_COMMIT_EVENTS {
                         break;
@@ -465,10 +495,9 @@ fn writer_loop(
                             metadata,
                             log,
                             upload,
-                            acknowledgement,
                         }) => {
                             decrement_queue_depth(state);
-                            next = Some((metadata, log, upload, acknowledgement));
+                            next = Some((metadata, log, upload));
                         }
                         Ok(command) => {
                             pending = Some(command);
@@ -486,27 +515,32 @@ fn writer_loop(
                         // Only rows marked for upload can form a batch, so a
                         // group of local-only rows does not wake the uploader.
                         let mut uploadable = false;
-                        for (command, result) in commands.into_iter().zip(results) {
-                            if let Ok(outcome) = &result {
-                                uploadable |= command.upload;
-                                update_persistence_stats(state, outcome);
+                        for (command, result) in commands.iter().zip(results) {
+                            match &result {
+                                Ok(outcome) => {
+                                    uploadable |= command.upload;
+                                    state
+                                        .stats
+                                        .persistence_committed
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    update_persistence_stats(state, outcome);
+                                }
+                                Err(_) => record_write_failures(state, 1),
                             }
-                            let _ = command.acknowledgement.send(result.map(|_| ()));
                         }
                         if uploadable {
                             let _ = wake_sender.try_send(());
                         }
                     }
-                    Err(error) => {
-                        let message = error.to_string();
-                        for command in commands {
-                            let error = PersistenceError::Sqlite(
-                                rusqlite::Error::InvalidParameterName(message.clone()),
-                            );
-                            let _ = command.acknowledgement.send(Err(error));
-                        }
-                    }
+                    // A lock held past `busy_timeout`, a full disk, or a
+                    // damaged file fails the whole transaction. Nobody waits
+                    // for these rows, so they are counted and dropped; the
+                    // writer keeps serving the queue.
+                    Err(_) => record_write_failures(state, commands.len() as u64),
                 }
+            }
+            Command::Flush { acknowledgement } => {
+                let _ = acknowledgement.send_blocking(());
             }
             Command::NextBatch {
                 max_count,
@@ -581,6 +615,20 @@ fn update_persistence_stats(state: &State, outcome: &InsertOutcome) {
         .fetch_add(outcome.abandoned, Ordering::Relaxed);
 }
 
+/// Count rows that were admitted but could not be written. They were already
+/// counted in `accepted`, so they are also lost telemetry (`dropped`).
+fn record_write_failures(state: &State, rows: u64) {
+    state
+        .stats
+        .persistence_write_failed
+        .fetch_add(rows, Ordering::Relaxed);
+    state
+        .stats
+        .persistence_failed
+        .fetch_add(rows, Ordering::Relaxed);
+    state.stats.dropped.fetch_add(rows, Ordering::Relaxed);
+}
+
 fn decrement_queue_depth(state: &State) {
     let _ = state
         .stats
@@ -593,20 +641,28 @@ fn decrement_queue_depth(state: &State) {
 impl Store {
     #[cfg(test)]
     fn open(config: PersistenceConfig, path: &Path) -> Result<Self, PersistenceError> {
-        Self::open_for_destination(config, path, b"test-destination")
+        Self::open_for_destination(config, path, Some(b"test-destination"))
     }
 
     fn open_for_destination(
         config: PersistenceConfig,
         path: &Path,
-        destination_fingerprint: &[u8],
+        destination: Option<&[u8]>,
     ) -> Result<Self, PersistenceError> {
         config.validate()?;
+        // A spool created without an SLS client is not bound to any
+        // destination yet (empty fingerprint). The first client that opens it
+        // binds it, so rows marked for upload while SLS was not configured are
+        // uploaded to that destination.
+        let destination_fingerprint = destination.unwrap_or_default();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         secure_spool_file(path)?;
         let mut connection = Connection::open(path)?;
+        // Set explicitly rather than relying on the library default: this is
+        // the longest a single write waits for another connection's lock.
+        connection.busy_timeout(config.busy_timeout)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "NORMAL")?;
         connection.pragma_update(None, "auto_vacuum", "NONE")?;
@@ -780,8 +836,19 @@ impl Store {
             [],
             |row| row.get::<_, Vec<u8>>(0),
         )?;
-        if stored_fingerprint != destination_fingerprint {
-            return Err(PersistenceError::DestinationMismatch);
+        match destination {
+            // Local-only: never sends, so any spool may be written.
+            None => {}
+            Some(fingerprint) if stored_fingerprint.is_empty() => {
+                connection.execute(
+                    "UPDATE spool_state SET destination_fingerprint = ?1 WHERE singleton = 1",
+                    params![fingerprint],
+                )?;
+            }
+            Some(fingerprint) if stored_fingerprint != fingerprint => {
+                return Err(PersistenceError::DestinationMismatch);
+            }
+            Some(_) => {}
         }
         Ok(Self {
             connection,
@@ -819,7 +886,6 @@ impl Store {
             payload,
             created_at_ms,
             upload,
-            acknowledgement: mpsc::sync_channel(1).0,
         }])?
         .pop()
         .expect("single insert produces one result")
@@ -1432,7 +1498,7 @@ fn secure_spool_file(path: &Path) -> Result<(), std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MayStaticKey;
+    use crate::{MayStaticKey, reporter::ReporterStatsSnapshot};
 
     fn temp_path(name: &str) -> PathBuf {
         let unique = format!(
@@ -1501,12 +1567,61 @@ mod tests {
         let path = temp_path("destination");
         let config = PersistenceConfig::new(1024 * 1024).path(path.clone());
         drop(
-            Store::open_for_destination(config.clone(), &path, b"endpoint/project/logstore-a")
-                .expect("create destination-bound spool"),
+            Store::open_for_destination(
+                config.clone(),
+                &path,
+                Some(b"endpoint/project/logstore-a"),
+            )
+            .expect("create destination-bound spool"),
         );
 
         assert!(matches!(
-            Store::open_for_destination(config, &path, b"endpoint/project/logstore-b"),
+            Store::open_for_destination(config, &path, Some(b"endpoint/project/logstore-b")),
+            Err(PersistenceError::DestinationMismatch)
+        ));
+        let _ = fs::remove_dir_all(path.parent().expect("temporary parent"));
+    }
+
+    #[test]
+    fn local_only_spool_is_bound_by_the_first_client_that_opens_it() {
+        let path = temp_path("local-only-binding");
+        let config = PersistenceConfig::new(1024 * 1024).path(path.clone());
+        let fingerprint = |store: &Store| {
+            store
+                .connection
+                .query_row(
+                    "SELECT destination_fingerprint FROM spool_state",
+                    [],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .expect("read fingerprint")
+        };
+        let mut local = Store::open_for_destination(config.clone(), &path, None)
+            .expect("create spool without a client");
+        assert!(fingerprint(&local).is_empty(), "no destination yet");
+        let (metadata, log) = event("before-sls");
+        local
+            .insert_at(&metadata, &log, now_millis(), true)
+            .expect("store upload row without a client");
+        drop(local);
+
+        let mut bound = Store::open_for_destination(config.clone(), &path, Some(b"logstore-a"))
+            .expect("first client binds the spool");
+        assert_eq!(fingerprint(&bound), b"logstore-a");
+        assert_eq!(bound.recover_pending().expect("recover").0, 1);
+        let batch = bound
+            .next_batch(10, usize::MAX, false)
+            .expect("select batch")
+            .expect("row stored without a client is uploaded");
+        assert_eq!(batch.logs, vec![log]);
+        drop(bound);
+
+        let local = Store::open_for_destination(config.clone(), &path, None)
+            .expect("local-only may reopen a bound spool");
+        assert_eq!(fingerprint(&local), b"logstore-a", "and does not unbind it");
+        drop(local);
+        assert!(matches!(
+            Store::open_for_destination(config, &path, Some(b"logstore-b")),
             Err(PersistenceError::DestinationMismatch)
         ));
         let _ = fs::remove_dir_all(path.parent().expect("temporary parent"));
@@ -1568,7 +1683,7 @@ mod tests {
             let store = Store::open_for_destination(
                 PersistenceConfig::new(1024 * 1024).path(path.clone()),
                 &path,
-                b"migration-destination",
+                Some(b"migration-destination"),
             )
             .expect("migrate legacy database");
             let migrated: i64 = store
@@ -1618,7 +1733,7 @@ mod tests {
             Store::open_for_destination(
                 PersistenceConfig::new(1024 * 1024).path(path.clone()),
                 &path,
-                b"destination"
+                Some(b"destination")
             ),
             Err(PersistenceError::Sqlite(_))
         ));
@@ -1647,47 +1762,45 @@ mod tests {
             sender,
             wake_receiver,
         };
-        let (metadata, log) = event("queued");
-        let (acknowledgement, _result) = mpsc::sync_channel(1);
-        persistence
-            .sender
-            .try_send(Command::Insert {
-                metadata: Arc::new(metadata),
-                log: Box::new(log),
-                upload: true,
-                acknowledgement,
-            })
-            .expect("first command fills queue");
         let state = State::default();
+        let (metadata, log) = event("queued");
+        assert!(
+            persistence
+                .enqueue(Arc::new(metadata), log, true, &state)
+                .is_ok(),
+            "first command fills queue without a running writer"
+        );
         let (metadata, log) = event("rejected");
 
         assert!(matches!(
-            persistence.commit(Arc::new(metadata), log, true, &state),
+            persistence.enqueue(Arc::new(metadata), log, true, &state),
             Err(AdmissionFailure::Full)
         ));
+        assert_eq!(state.stats.queue_depth.load(Ordering::Relaxed), 1);
         drop(receiver);
     }
 
-    fn queue_insert(
-        sender: &async_channel::Sender<Command>,
-        value: &str,
-    ) -> mpsc::Receiver<Result<(), PersistenceError>> {
+    fn queue_insert(sender: &async_channel::Sender<Command>, value: &str) {
         let (metadata, log) = event(value);
-        let (acknowledgement, result) = mpsc::sync_channel(1);
         sender
             .send_blocking(Command::Insert {
                 metadata: Arc::new(metadata),
                 log: Box::new(log),
                 upload: true,
-                acknowledgement,
             })
             .expect("queue insert");
-        result
     }
 
-    fn run_queued_commands(store: &mut Store, receiver: async_channel::Receiver<Command>) {
+    /// Run the writer over the queued commands and return the statistics it
+    /// recorded: with fire-and-forget inserts they are the only outcome.
+    fn run_queued_commands(
+        store: &mut Store,
+        receiver: async_channel::Receiver<Command>,
+    ) -> ReporterStatsSnapshot {
         let (wake_sender, _wake_receiver) = async_channel::bounded(1);
-        writer_loop(store, receiver, wake_sender, &State::default());
+        let state = State::default();
+        writer_loop(store, receiver, wake_sender, &state);
+        state.snapshot()
     }
 
     #[test]
@@ -1699,25 +1812,23 @@ mod tests {
         )
         .expect("open store");
         let (sender, receiver) = async_channel::bounded(64);
-        let acknowledgements = (0..20)
-            .map(|index| queue_insert(&sender, &format!("event-{index}")))
-            .collect::<Vec<_>>();
+        for index in 0..20 {
+            queue_insert(&sender, &format!("event-{index}"));
+        }
         drop(sender);
 
-        run_queued_commands(&mut store, receiver);
+        let stats = run_queued_commands(&mut store, receiver);
 
         assert_eq!(store.committed_transactions, 1);
+        assert_eq!(
+            (stats.persistence_committed, stats.persistence_write_failed),
+            (20, 0)
+        );
         let observer = Connection::open(&path).expect("open observer");
-        for (index, acknowledgement) in acknowledgements.into_iter().enumerate() {
-            acknowledgement
-                .recv()
-                .expect("writer response")
-                .expect("committed insert");
-            let visible: i64 = observer
-                .query_row("SELECT COUNT(*) FROM pending_events", [], |row| row.get(0))
-                .expect("count committed rows");
-            assert_eq!(visible, 20, "ack {index} preceded the shared commit");
-        }
+        let visible: i64 = observer
+            .query_row("SELECT COUNT(*) FROM pending_events", [], |row| row.get(0))
+            .expect("count committed rows");
+        assert_eq!(visible, 20);
         let _ = fs::remove_dir_all(path.parent().expect("temporary parent"));
     }
 
@@ -1730,22 +1841,22 @@ mod tests {
         )
         .expect("open store");
         let (sender, receiver) = async_channel::bounded(8);
-        let first = queue_insert(&sender, "first");
-        let oversized = queue_insert(&sender, &"x".repeat(1024 * 1024));
-        let second = queue_insert(&sender, "second");
+        queue_insert(&sender, "first");
+        queue_insert(&sender, &"x".repeat(1024 * 1024));
+        queue_insert(&sender, "second");
         drop(sender);
 
-        run_queued_commands(&mut store, receiver);
+        let stats = run_queued_commands(&mut store, receiver);
 
-        first.recv().expect("first response").expect("first commit");
-        assert!(matches!(
-            oversized.recv().expect("oversized response"),
-            Err(PersistenceError::EventTooLarge)
-        ));
-        second
-            .recv()
-            .expect("second response")
-            .expect("second commit");
+        assert_eq!(
+            (
+                stats.persistence_committed,
+                stats.persistence_write_failed,
+                stats.dropped
+            ),
+            (2, 1, 1),
+            "the oversized row is counted as a write failure and lost"
+        );
         assert_eq!(store.committed_transactions, 1);
         assert_eq!(
             store
@@ -1768,7 +1879,7 @@ mod tests {
         )
         .expect("open store");
         let (sender, receiver) = async_channel::bounded(8);
-        let first = queue_insert(&sender, "first");
+        queue_insert(&sender, "first");
         let (batch_sender, batch_result) = async_channel::bounded(1);
         sender
             .send_blocking(Command::NextBatch {
@@ -1778,22 +1889,18 @@ mod tests {
                 acknowledgement: batch_sender,
             })
             .expect("queue next batch");
-        let second = queue_insert(&sender, "second");
+        queue_insert(&sender, "second");
         drop(sender);
 
-        run_queued_commands(&mut store, receiver);
+        let stats = run_queued_commands(&mut store, receiver);
 
-        first.recv().expect("first response").expect("first commit");
         let batch = batch_result
             .recv_blocking()
             .expect("batch response")
             .expect("batch query")
             .expect("assigned batch");
         assert_eq!(batch.logs, vec![event("first").1]);
-        second
-            .recv()
-            .expect("second response")
-            .expect("second commit");
+        assert_eq!(stats.persistence_committed, 2);
         let _ = fs::remove_dir_all(path.parent().expect("temporary parent"));
     }
 
@@ -1807,14 +1914,22 @@ mod tests {
         .expect("open store");
         store.fail_group_commit = true;
         let (sender, receiver) = async_channel::bounded(8);
-        let first = queue_insert(&sender, "first");
-        let second = queue_insert(&sender, "second");
+        queue_insert(&sender, "first");
+        queue_insert(&sender, "second");
         drop(sender);
 
-        run_queued_commands(&mut store, receiver);
+        let stats = run_queued_commands(&mut store, receiver);
 
-        assert!(first.recv().expect("first response").is_err());
-        assert!(second.recv().expect("second response").is_err());
+        assert_eq!(
+            (
+                stats.persistence_committed,
+                stats.persistence_write_failed,
+                stats.persistence_failed,
+                stats.dropped
+            ),
+            (0, 2, 2, 2),
+            "every row of the failed group is counted, none as committed"
+        );
         assert_eq!(store.committed_transactions, 0);
         assert_eq!(
             actual_pending_totals(&store.connection).expect("totals"),
@@ -1832,16 +1947,15 @@ mod tests {
         )
         .expect("open count store");
         let (sender, receiver) = async_channel::bounded(64);
-        let acknowledgements = (0..MAX_GROUP_COMMIT_EVENTS + 1)
-            .map(|index| queue_insert(&sender, &format!("event-{index}")))
-            .collect::<Vec<_>>();
+        for index in 0..MAX_GROUP_COMMIT_EVENTS + 1 {
+            queue_insert(&sender, &format!("event-{index}"));
+        }
         drop(sender);
-        run_queued_commands(&mut count_store, receiver);
+        let stats = run_queued_commands(&mut count_store, receiver);
         assert_eq!(count_store.committed_transactions, 2);
-        assert!(
-            acknowledgements
-                .into_iter()
-                .all(|ack| ack.recv().expect("response").is_ok())
+        assert_eq!(
+            stats.persistence_committed,
+            MAX_GROUP_COMMIT_EVENTS as u64 + 1
         );
 
         let byte_path = temp_path("group-byte-bound");
@@ -1851,8 +1965,8 @@ mod tests {
         )
         .expect("open byte store");
         let (sender, receiver) = async_channel::bounded(4);
-        let first = queue_insert(&sender, &"a".repeat(MAX_GROUP_COMMIT_BYTES / 2 + 1));
-        let second = queue_insert(&sender, &"b".repeat(MAX_GROUP_COMMIT_BYTES / 2 + 1));
+        queue_insert(&sender, &"a".repeat(MAX_GROUP_COMMIT_BYTES / 2 + 1));
+        queue_insert(&sender, &"b".repeat(MAX_GROUP_COMMIT_BYTES / 2 + 1));
         drop(sender);
         let state = State::default();
         state.stats.queue_depth.store(2, Ordering::Relaxed);
@@ -1860,8 +1974,7 @@ mod tests {
         writer_loop(&mut byte_store, receiver, wake_sender, &state);
         assert_eq!(byte_store.committed_transactions, 2);
         assert_eq!(state.stats.queue_depth.load(Ordering::Relaxed), 0);
-        assert!(first.recv().expect("first response").is_ok());
-        assert!(second.recv().expect("second response").is_ok());
+        assert_eq!(state.snapshot().persistence_committed, 2);
 
         for path in [count_path, byte_path] {
             let _ = fs::remove_dir_all(path.parent().expect("temporary parent"));

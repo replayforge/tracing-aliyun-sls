@@ -449,20 +449,27 @@ channel send, retry sleep, compression, or network operation in admission.
 Feature `persist` plus `build_with_persistence`:
 
 ```text
-producer -> bounded persistence command queue
+producer -> bounded persistence command queue -> Accepted returned
          -> one SQLite writer (WAL / NORMAL / auto_vacuum NONE)
-         -> pending row committed -> Accepted returned
+         -> pending row committed (or counted as a write failure)
          -> one assigned durable batch / one upload lane
          -> SLS route key + seqid retry
          -> local SQLite acknowledgement deletes assigned rows
 ```
 
-The invariant changes deliberately: persistent admission still never waits for
-network delivery or for queue capacity, but it synchronously waits for the
-dedicated writer's SQLite transaction. It can therefore block for storage I/O
-latency. A full/closed command queue, event/retention rejection, writer
-failure, or SQLite error immediately returns `PersistenceFailed`; no
-uncommitted event is reported as accepted.
+The admission invariant is the same as without persistence (rewritten
+2026-10-20; until then persistent admission synchronously waited for the
+writer's SQLite transaction, with no timeout, so a spool locked by another
+connection stalled every thread that emitted a log). Persistent admission is a
+nonblocking `try_send` onto the bounded command queue: it never waits for the
+SQLite commit, a SQLite lock, storage I/O latency, network delivery, or queue
+capacity. A full/closed command queue or an event larger than the maximum
+batch size returns `PersistenceFailed`. Everything after the queue happens on
+the writer thread and cannot reach the caller: rows it commits are counted in
+`persistence_committed`, rows it cannot store (serialization, storage budget,
+SQLite errors such as a full disk, a damaged file, or a lock held longer than
+`PersistenceConfig::busy_timeout`) in `persistence_write_failed`. `Accepted`
+therefore means queued, not committed; see the asynchronous-write addendum.
 
 ### Configuration and storage policy
 
@@ -492,13 +499,16 @@ CPU cost includes serialization, decoding recovered rows, SQLite transactions,
 and normal request encoding/compression. Memory remains bounded by the command
 queue, one decoded upload batch, the SQLite cache, and HTTP/compression
 buffers, but the exact allocator and backend footprint is not a fixed limit.
-Disk write latency is visible to persistent admission.
+Disk write latency is absorbed by the writer queue; when the writer falls
+behind by a full queue, further admissions are rejected and counted in
+`queue_full`.
 
 ### Guarantees and non-guarantees
 
-After `try_report` returns `Accepted` in persistent mode, its row's SQLite
-transaction committed. With `synchronous=NORMAL`, this is intended to survive
-ordinary process termination, including forced termination. A reopened
+After the writer commits a row (counted in `persistence_committed`), with
+`synchronous=NORMAL` it is intended to survive ordinary process termination,
+including forced termination. Rows still in the command queue are lost on a
+crash: `Accepted` is returned before the commit. A reopened
 reporter validates and counts all rows before reporting starts.
 
 A spool is cryptographically-uninteresting but exact-byte bound to its
@@ -749,9 +759,9 @@ unassigned (that is, not yet sent) rows.
   layers without an upload decision. With a decision installed, the callback
   is application code on the `on_event` path. The library imposes the same
   rule on it as on itself: no HTTP, sleep, retry, blocking channel send, or
-  re-entrant `tracing`. Persistent admission still synchronously waits for the
-  SQLite commit, as documented in the persistence addendum; a local-only row
-  costs the same commit.
+  re-entrant `tracing`. Persistent admission still synchronously waited for
+  the SQLite commit at this point (superseded by the asynchronous-write
+  addendum of 2026-10-20); a local-only row costs the same commit.
 - **Acknowledged rows** are retained instead of deleted. Their removal is now
   a retention decision, and a full spool of sent rows is evicted oldest-first
   rather than blocking admission.
@@ -826,3 +836,120 @@ these tests.
 - **Wake-up tests**: a committed group of local-only rows does not wake the
   uploader, a group containing an upload row does, and a waiting
   `next_persistent_batch` returns the new upload row.
+
+## Asynchronous persistence writes and local-only spool addendum (2026-10-20)
+
+This addendum is the current state for `persist` builds and supersedes every
+earlier statement that persistent admission waits for the SQLite commit or
+that `Accepted` means committed.
+
+### Why
+
+Persistent admission used to send the row to the writer thread and block on
+its reply, without a timeout. An application measured the consequence: with
+the spool locked by another connection (`BEGIN EXCLUSIVE`, for example an
+operator's `sqlite3` shell), the thread emitting a log waited for SQLite's busy
+handler and then for every statement of the group, and the application's
+command path stalled for many seconds. The application chose to make local
+writes fully asynchronous and to accept losing the last few events on a crash.
+It also needs the local history when SLS is not configured at all, which
+required a spool without an SLS client.
+
+### What changed
+
+- **Admission** (`Reporter::try_report`, `try_report_with_upload`, `report*`,
+  and therefore `Layer::on_event`): `PersistenceSender::enqueue` does one
+  nonblocking `try_send` of the row onto the bounded command queue and
+  returns. `Accepted` is counted at that point. The `Insert` command no longer
+  carries a reply channel.
+- **Writer thread** counts each row's outcome itself: `persistence_committed`
+  on commit; on any failure (serialization, storage budget, or a failed group
+  transaction) the new `persistence_write_failed`, plus `persistence_failed`
+  and `dropped`. A failed group fails all its rows, as before; the writer
+  then keeps serving the queue.
+- **`PersistenceConfig::busy_timeout`** (new, default 5 s) is set explicitly on
+  the writer's connection instead of relying on the library default. Only the
+  writer waits for it.
+- **Queue full**: when the writer falls behind by `queue_capacity` rows,
+  admission returns `PersistenceFailed` and counts `queue_full`,
+  `persistence_failed`, and `dropped`, as before; it never waits for capacity.
+  In persistent mode `queue_full` counts exactly this queue (the in-memory
+  queue is not used), so no second counter was added.
+- **`Command::Flush`** answers once every earlier command was handled (the
+  queue is FIFO). Graceful shutdown first drains the writer queue with it,
+  racing the existing shutdown deadline, then sends the remaining batches
+  under the same deadline. A writer stuck on a lock therefore cannot hold up
+  shutdown beyond `shutdown_timeout`.
+- **`Reporter::local_only(ReporterConfig, PersistenceConfig)`** starts the
+  writer without an SLS client. Rows keep their `upload` flag; nothing is ever
+  assigned or sent. Its reporting future waits for the shutdown signal and
+  drains the writer queue. `Reporter` and `Reporting` hold the client as an
+  `Option`; only `local_only` has none, and it always has a spool.
+- **Destination binding**: a spool created without a client stores an empty
+  destination fingerprint. The first client that opens it writes its
+  fingerprint, after which the existing exact-match check applies; its
+  retained `upload = 1 AND sent = 0` rows are recovered and uploaded like any
+  other. A local-only reporter accepts a spool already bound to a destination
+  and leaves the binding unchanged.
+
+### Invariants
+
+- **Admission (`on_event`)**: in every mode, no HTTP, sleep, retry,
+  compression, disk I/O, SQLite lock wait, or blocking channel send occurs in
+  admission. This restores the original hardened invariant for `persist`
+  builds. An upload decision callback is still application code on that path.
+- **Idempotency and no-duplicate semantics are unchanged**: only
+  `upload = 1`, unsent, unassigned rows form a batch; one assigned batch at a
+  time with a stable spool key and monotonic `seqid`; local acknowledgement
+  marks rows sent. Commands are still handled in FIFO order, so a `NextBatch`
+  sees every insert queued before it.
+- **Loss window widened**: previously from `on_event` entry to the commit,
+  with the caller waiting through it; now the same span, but the caller has
+  already returned. A crash or power loss loses rows still in the queue.
+  The `NORMAL` durability statements apply only to committed rows.
+
+### Not guaranteed
+
+- Rows accepted but still queued when the process is killed are lost.
+- A lock held longer than `busy_timeout` fails the group the writer is
+  holding (counted); rows queued behind it wait, and are rejected at
+  admission once the queue is full (counted).
+- A real full disk was not simulated in tests; it reaches the writer as a
+  SQLite error on the group transaction, the same path the forced group
+  failure and the lock timeout exercise.
+- Opening a bound spool with a different destination still fails with
+  `DestinationMismatch`, as before.
+
+### Validation
+
+New deterministic tests, each shown to fail under a targeted mutation:
+
+| Test | Mutation that turns it red |
+|---|---|
+| `locked_spool_does_not_block_admission_and_rows_follow_unlock`: 1000 admissions with the spool under `BEGIN EXCLUSIVE`, each must return within 50 ms; after unlock all 1000 rows are committed | admission waits for the writer (restoring synchronous semantics): first call took 5.2 s |
+| `full_writer_queue_drops_and_counts`: queue of 4 under a lock, 20 admissions | not counting `queue_full` |
+| `write_failure_under_lock_is_counted_and_writer_recovers`: `busy_timeout` 50 ms under a lock, 10 rows counted as write failures, a later row commits | not counting `persistence_write_failed` |
+| `local_only_reporter_stores_without_client_and_later_client_uploads` | not binding an unbound spool (`DestinationMismatch`) |
+| `graceful_shutdown_drains_the_writer_queue`: 100 rows queued behind a lock released after 200 ms are committed when shutdown returns | removing the shutdown drain (0 of 100 committed) |
+| `graceful_shutdown_drain_is_bounded_by_the_shutdown_timeout`: 200 ms deadline, writer stuck on a 30 s lock | draining without the deadline (62 s) |
+
+Measured `try_report` latency with the spool locked, 1000 calls, one run each
+on an Apple Silicon Mac: debug p50 500 ns, p99 1.54 µs, max 12.25 µs; release
+p50 83 ns, p99 1.17 µs, max 3.92 µs.
+
+The persistent stress example now retries on a full writer queue and measures
+until the last row is committed. Release, 100,000 events, one run each:
+1 producer 224,041 events/s end to end (synchronous admission before:
+35,824-36,700 events/s), per-attempt admission average 75 ns, max 29.5 µs;
+8 producers 210,867 events/s (before: 95,304-96,291 events/s). The writer
+now always finds full 32-row groups waiting, which explains most of the gain;
+these are single local runs, not a performance guarantee.
+
+Commands run on the final tree, all exit 0: `cargo fmt --all -- --check`;
+`cargo clippy -- -D warnings` with `--all-targets` for the workspace, the
+workspace with `persist`, `aliyun-sls` with `persist`, and `aliyun-sls` with
+`--no-default-features --features reporter,reqwest-rustls,lz4`;
+`cargo test --workspace` (22 `aliyun-sls` and 4 `tracing-aliyun-sls` unit
+tests, 1 ignored); `cargo test --workspace --features persist` (78
+`aliyun-sls` unit tests with 2 ignored, the 2 subprocess crash tests, 6
+`tracing-aliyun-sls` unit tests); `cargo test --workspace --doc`.

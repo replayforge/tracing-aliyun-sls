@@ -9,6 +9,12 @@
 //! ```
 //!
 //! Arguments are event count, storage bytes, and producer thread count.
+//!
+//! Admission only queues the event for the SQLite writer thread, so producers
+//! here retry when that queue is full (a real application would drop and
+//! count instead) and the run ends once the writer has handled every event.
+//! `admission_*` is the per-attempt `try_report` latency; `events_per_second`
+//! is end to end, until the last event is committed.
 
 use aliyun_sls::{
     Log, LogGroupMetadata, MayStaticKey, SlsClient,
@@ -72,6 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         threads.push(std::thread::spawn(move || {
             barrier.wait();
             let mut admission_nanos = 0u128;
+            let mut attempts = 0u128;
             let mut max_admission = Duration::ZERO;
             let mut unexpected = None;
             for index in start..end {
@@ -79,49 +86,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     MayStaticKey::from_static("message"),
                     "persistent stress event",
                 );
-                let admission_started = Instant::now();
-                let result = reporter.try_report(metadata.clone(), log);
-                let latency = admission_started.elapsed();
-                admission_nanos = admission_nanos.saturating_add(latency.as_nanos());
-                max_admission = max_admission.max(latency);
-                if !matches!(
-                    result,
-                    ReportResult::Accepted | ReportResult::PersistenceFailed
-                ) {
-                    unexpected = Some(result);
+                loop {
+                    let attempt = log.clone();
+                    let admission_started = Instant::now();
+                    let result = reporter.try_report(metadata.clone(), attempt);
+                    let latency = admission_started.elapsed();
+                    admission_nanos = admission_nanos.saturating_add(latency.as_nanos());
+                    attempts += 1;
+                    max_admission = max_admission.max(latency);
+                    match result {
+                        ReportResult::Accepted => break,
+                        // The only rejection possible here is a full writer
+                        // queue: wait for the writer instead of losing it.
+                        ReportResult::PersistenceFailed => std::thread::yield_now(),
+                        other => {
+                            unexpected = Some(other);
+                            break;
+                        }
+                    }
+                }
+                if unexpected.is_some() {
                     break;
                 }
             }
-            (admission_nanos, max_admission, unexpected)
+            (admission_nanos, attempts, max_admission, unexpected)
         }));
     }
     let mut admission_nanos = 0u128;
+    let mut attempts = 0u128;
     let mut max_admission = Duration::ZERO;
     for thread in threads {
-        let (thread_nanos, thread_max, unexpected) =
+        let (thread_nanos, thread_attempts, thread_max, unexpected) =
             thread.join().map_err(|_| "producer thread panicked")?;
         admission_nanos = admission_nanos.saturating_add(thread_nanos);
+        attempts = attempts.saturating_add(thread_attempts);
         max_admission = max_admission.max(thread_max);
         if let Some(result) = unexpected {
             return Err(format!("unexpected persistent admission result: {result:?}").into());
         }
     }
+    // Wait for the writer thread to handle every accepted event.
+    loop {
+        let stats = reporter.stats();
+        if stats.persistence_committed + stats.persistence_write_failed >= stats.accepted {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
     let elapsed = started.elapsed();
     let stats = reporter.stats();
     let physical_bytes = sqlite_physical_bytes(&path)?;
-    let average_nanos = admission_nanos / event_count.max(1) as u128;
+    let average_nanos = admission_nanos / attempts.max(1);
     let rss = resident_set_bytes()
         .map(|bytes| bytes.to_string())
         .unwrap_or_else(|| "unavailable".to_owned());
 
     println!(
-        "events={event_count} producers={producer_count} accepted={} persistence_failures={} \
-         evicted_count={} evicted_age={} evicted_storage={} evicted_bytes={} \
+        "events={event_count} producers={producer_count} accepted={} committed={} \
+         write_failed={} queue_full_retries={} evicted_count={} evicted_age={} evicted_storage={} evicted_bytes={} \
          pending_rows={} pending_bytes={} sqlite_physical_bytes={physical_bytes} \
          elapsed={elapsed:?} events_per_second={:.0} \
          admission_average_ns={average_nanos} admission_max={max_admission:?} rss_bytes={rss}",
         stats.accepted,
-        stats.persistence_failed,
+        stats.persistence_committed,
+        stats.persistence_write_failed,
+        stats.queue_full,
         stats.persistence_evicted_count,
         stats.persistence_evicted_age,
         stats.persistence_evicted_storage,

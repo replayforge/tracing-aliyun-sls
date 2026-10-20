@@ -137,11 +137,27 @@ mode `0600`; applications must also protect its parent directory.
 
 Persistent mode uses SQLite WAL, `synchronous=NORMAL`, and
 `auto_vacuum=NONE`, with one writer thread and one upload lane. `try_report`
-does not wait for network or free queue capacity, but it does synchronously
-wait for its SQLite transaction to commit. Queue saturation, encoding/limit
-rejection, and SQLite errors immediately return
-`ReportResult::PersistenceFailed`. This changes the memory-only
-nonblocking/no-disk-I/O admission invariant.
+only hands the event to the writer thread through a bounded queue: it never
+waits for the SQLite commit, a lock held by another connection, the network,
+or free queue capacity, so the memory-only nonblocking/no-disk-I/O admission
+invariant holds in persistent mode too. A full or closed queue, or an event
+larger than the maximum batch size, returns `ReportResult::PersistenceFailed`
+and is counted in `queue_full`/`queue_closed`. A write that fails afterwards
+(disk full, the file locked by another connection for longer than
+`PersistenceConfig::busy_timeout`, default 5 s, a damaged file) cannot be
+reported to the caller any more; it is counted in `persistence_write_failed`.
+
+**`Accepted` is not durable yet.** Rows still in the writer queue when the
+process is killed, or when the machine loses power, are lost: a crash can lose
+the last few events. Graceful shutdown drains the writer queue (bounded by the
+shutdown timeout) before sending the remaining batches.
+
+`Reporter::local_only(config, persistence)` builds a reporter with a spool and
+no SLS client: every event is stored with its `upload` flag and nothing is
+sent. Start its reporting future with a graceful shutdown as usual; it only
+drains the writer queue. A spool created this way is not bound to a
+destination until an SLS client first opens it; that client then uploads the
+retained rows that were marked for upload.
 
 The spool is also the local log history. Every row carries an `upload` flag,
 decided per event by the caller, and a `sent` marker:
